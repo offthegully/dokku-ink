@@ -98,7 +98,7 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 - **Domains & SSL** — per-app vhosts, routing enabled/disabled, and certificate issuer + expiry (highlighted when expiring within 14 days).
 - **Processes** — per-process scale and individual container statuses, plus restart policy.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
-- **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted).
+- **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
 - **Cheat Sheet** — a scrollable reference of the most useful `dokku` commands, grouped by area.
 
 ## Troubleshooting

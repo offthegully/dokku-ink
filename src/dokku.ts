@@ -320,6 +320,10 @@ export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (m
   const child = spawn(DOKKU_BIN, ['logs', app, '-t', '-n', '100'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // App output can carry ANSI colour codes, tabs and \r — all of which throw
+  // off Ink's width math and cause the layout to jitter. Strip to plain text.
+  const sanitize = (s: string) =>
+    s.replace(/\r$/, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\t/g, '  ');
   const readLines = (stream: NodeJS.ReadableStream, isErr: boolean) => {
     let buf = '';
     stream.setEncoding('utf8');
@@ -329,7 +333,7 @@ export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (m
       while ((i = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, i);
         buf = buf.slice(i + 1);
-        if (line.trim()) onLine(line, isErr);
+        if (line.trim()) onLine(sanitize(line), isErr);
       }
     });
   };

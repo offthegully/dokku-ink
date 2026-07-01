@@ -9,6 +9,7 @@ import {
   padEnd,
   fmtDate,
   daysUntil,
+  leadingTimestamp,
   runningBadge,
   soonestCert,
   sslBadge,
@@ -41,6 +42,9 @@ const REFRESH_SECONDS = (() => {
 })();
 
 const LOG_CAP = 500;
+// Keep per-app log buffers around after leaving the view, so flipping between
+// apps (or views) and back doesn't drop scrollback or re-replay history.
+const LOG_CACHE_TTL_MS = 5 * 60_000;
 
 interface LogLine {
   text: string;
@@ -111,7 +115,7 @@ function Header({
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
       <Box>
-        {refreshing ? <Text color={theme.dim}>↻ </Text> : null}
+        <Text color={theme.dim}>{refreshing ? '↻ ' : '  '}</Text>
         {cert ? (
           <Text wrap="truncate-end" color={cert.days < 0 ? theme.bad : cert.days <= 14 ? theme.warn : theme.dim}>
             cert: {cert.app} {cert.days < 0 ? 'expired' : `${cert.days}d`}{'  '}
@@ -136,7 +140,7 @@ function Header({
 
 function Menu({ view, focused }: { view: number; focused: boolean }): ReactNode {
   return (
-    <Box flexDirection="column" width={24} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
+    <Box flexDirection="column" width={24} flexShrink={0} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
       <Text color={theme.dim}>VIEWS</Text>
       {VIEWS.map((v, i) => {
         const sel = i === view;
@@ -163,7 +167,7 @@ function AppSelector({
 }): ReactNode {
   const { start, items } = windowed(apps, selected, height);
   return (
-    <Box flexDirection="column" width={20} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
+    <Box flexDirection="column" width={20} flexShrink={0} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
       <Text color={theme.dim}>APPS</Text>
       {items.map((a, i) => {
         const idx = start + i;
@@ -406,11 +410,13 @@ function LogsView({
   lines,
   viewport,
   offset,
+  width,
 }: {
   app?: DokkuApp;
   lines: LogLine[];
   viewport: number;
   offset: number; // scrollback distance from the live tail (0 = following)
+  width: number;
 }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
   const rows = Math.max(1, viewport - 1); // one row reserved for the status line
@@ -430,9 +436,11 @@ function LogsView({
       {visible.length === 0 ? (
         <Text color={theme.dim}>Waiting for log output…</Text>
       ) : (
+        // Truncated in JS (not just wrap=) so Yoga never measures an over-wide
+        // line — long lines would otherwise squeeze the fixed side panes.
         visible.map((l, i) => (
-          <Text key={end - visible.length + i} wrap="truncate-end" color={l.err ? theme.warn : theme.text}>
-            {l.text}
+          <Text key={end - visible.length + i} color={l.err ? theme.warn : theme.text}>
+            {truncate(l.text, width)}
           </Text>
         ))
       )}
@@ -560,28 +568,47 @@ export default function App(): ReactNode {
 
   // Tail logs while the Logs view is showing an app. Lines are buffered and
   // flushed on an interval so a chatty app doesn't re-render per line.
+  // Buffers are cached per app so coming back within the TTL shows history
+  // instantly; the re-attach replay (`-n 100`) is deduped by timestamp.
+  const logCache = useRef(new Map<string, { lines: LogLine[]; at: number }>());
   const logApp = currentView.key === 'logs' ? currentApp?.name : undefined;
   useEffect(() => {
     if (!logApp) return;
-    setLogLines([]);
+    const cached = logCache.current.get(logApp);
+    const seed = cached && Date.now() - cached.at < LOG_CACHE_TTL_MS ? cached.lines : [];
+    setLogLines(seed);
+
+    // The replay is chronological, so drop lines until we pass the last
+    // timestamp we already have; anything unstamped ends the sync.
+    const lastTs = seed.length ? leadingTimestamp(seed[seed.length - 1].text) : null;
+    let syncing = lastTs !== null;
     const buf: LogLine[] = [];
+    const push = (text: string, err: boolean) => {
+      if (syncing) {
+        const ts = leadingTimestamp(text);
+        if (ts && ts <= lastTs!) return;
+        syncing = false;
+      }
+      buf.push({ text, err });
+    };
+
     const flush = setInterval(() => {
       if (buf.length === 0) return;
       const chunk = buf.splice(0, buf.length);
       setLogLines((prev) => {
         const next = prev.concat(chunk);
-        return next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
+        const capped = next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
+        logCache.current.set(logApp, { lines: capped, at: Date.now() });
+        return capped;
       });
     }, 150);
-    const stop = tailLogs(
-      logApp,
-      source,
-      (text, err) => buf.push({ text, err }),
-      (msg) => buf.push({ text: msg, err: true }),
-    );
+    const stop = tailLogs(logApp, source, push, (msg) => push(msg, true));
     return () => {
       clearInterval(flush);
       stop();
+      // TTL counts from when we left the view, not from the last log line.
+      const cur = logCache.current.get(logApp);
+      if (cur) cur.at = Date.now();
     };
   }, [logApp, source]);
 
@@ -711,7 +738,7 @@ export default function App(): ReactNode {
       );
       break;
     case 'logs':
-      content = <LogsView app={currentApp} lines={logLines} viewport={viewport} offset={scroll} />;
+      content = <LogsView app={currentApp} lines={logLines} viewport={viewport} offset={scroll} width={colBudget} />;
       break;
     case 'cheatsheet':
       content = <CheatsheetView width={colBudget} viewport={viewport} scroll={scroll} />;
@@ -733,7 +760,8 @@ export default function App(): ReactNode {
           <AppSelector apps={apps} selected={selectedApp} focused={focus === 'content'} height={viewport} />
         ) : null}
         <Box
-          flexGrow={1}
+          width={contentW}
+          flexShrink={0}
           flexDirection="column"
           borderStyle="round"
           borderColor={focus === 'content' && !currentView.perApp ? theme.accent : theme.dim}

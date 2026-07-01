@@ -73,6 +73,14 @@ export function soonestCert(apps: DokkuApp[]): { app: string; days: number } | n
   return best;
 }
 
+// Leading RFC3339 timestamp of a `docker logs -t` line, or null. Used to skip
+// the replayed head when re-attaching to a log stream we already have cached:
+// timestamps are lexicographically ordered, so `ts <= lastSeen` means "old".
+export function leadingTimestamp(line: string): string | null {
+  const m = /^(\d{4}-\d{2}-\d{2}T[0-9:.]+Z?)/.exec(line);
+  return m ? m[1] : null;
+}
+
 // Window an array around a selected index so it fits `size` rows.
 export function windowed<T>(
   list: T[],

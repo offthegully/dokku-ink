@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApps, toBool } from '../src/dokku.js';
-import { sslBadge, runningBadge, soonestCert } from '../src/ui.js';
+import { sslBadge, runningBadge, soonestCert, leadingTimestamp } from '../src/ui.js';
 import type { RawReport } from '../src/types.js';
 
 // Sample shaped like real `dokku <plugin>:report --format json` output
@@ -123,6 +123,14 @@ test('badges classify state correctly', () => {
     sslBadge({ enabled: true, issuer: null, hostnames: [], startsAt: null, verified: null, expiresAt: '2000-01-01' }).text.includes('expired'),
     true,
   );
+});
+
+test('leadingTimestamp extracts and orders docker -t timestamps', () => {
+  const a = leadingTimestamp('2026-07-01T18:22:29.599983966Z app[web.1]: GET / 200');
+  const b = leadingTimestamp('2026-07-01T20:55:23.828667019Z app[web.1]: GET / 200');
+  assert.equal(a, '2026-07-01T18:22:29.599983966Z');
+  assert.ok(a! < b!); // lexicographic order == chronological order
+  assert.equal(leadingTimestamp('log stream ended (exit 1)'), null);
 });
 
 test('soonestCert picks the certificate expiring first', () => {
