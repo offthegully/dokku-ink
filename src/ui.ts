@@ -41,9 +41,13 @@ export function daysUntil(iso: string | null | undefined): number | null {
   return Math.round((d.getTime() - Date.now()) / 86400000);
 }
 
-export function runningBadge(app: Pick<DokkuApp, 'running'>): Badge {
+export function runningBadge(app: Pick<DokkuApp, 'running' | 'deployed'>): Badge {
   if (app.running === true) return { text: '● running', color: theme.good };
-  if (app.running === false) return { text: '○ stopped', color: theme.bad };
+  if (app.running === false) {
+    // An app that was never deployed isn't in trouble — don't paint it red.
+    if (!app.deployed) return { text: '· not deployed', color: theme.dim };
+    return { text: '○ stopped', color: theme.bad };
+  }
   return { text: '· unknown', color: theme.dim };
 }
 
@@ -54,6 +58,19 @@ export function sslBadge(ssl: Ssl | null | undefined): Badge {
   if (days !== null && days < 0) return { text: `${issuer} expired`, color: theme.bad };
   if (days !== null && days <= 14) return { text: `${issuer} ${days}d left`, color: theme.warn };
   return { text: `${issuer} ✔`, color: theme.good };
+}
+
+// The app whose SSL certificate expires soonest — surfaced in the header so
+// an upcoming renewal is hard to miss.
+export function soonestCert(apps: DokkuApp[]): { app: string; days: number } | null {
+  let best: { app: string; days: number } | null = null;
+  for (const a of apps) {
+    if (!a.ssl?.enabled) continue;
+    const days = daysUntil(a.ssl.expiresAt);
+    if (days === null) continue;
+    if (!best || days < best.days) best = { app: a.name, days };
+  }
+  return best;
 }
 
 // Window an array around a selected index so it fits `size` rows.

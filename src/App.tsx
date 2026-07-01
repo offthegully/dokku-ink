@@ -1,7 +1,7 @@
 // Main TUI for dokku-dash: a read-only dashboard over a Dokku host plus a
 // built-in command cheat sheet.
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import {
   theme,
@@ -10,15 +10,16 @@ import {
   fmtDate,
   daysUntil,
   runningBadge,
+  soonestCert,
   sslBadge,
   windowed,
 } from './ui.js';
-import { loadOverview, loadConfig } from './dokku.js';
+import { loadOverview, loadConfig, tailLogs } from './dokku.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type { DokkuApp, Overview, Source } from './types.js';
 
 interface ViewDef {
-  key: 'apps' | 'domains' | 'process' | 'config' | 'cheatsheet';
+  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'cheatsheet';
   label: string;
   perApp: boolean;
 }
@@ -28,8 +29,23 @@ const VIEWS: ViewDef[] = [
   { key: 'domains', label: 'Domains & SSL', perApp: true },
   { key: 'process', label: 'Processes', perApp: true },
   { key: 'config', label: 'Config / Env', perApp: true },
+  { key: 'logs', label: 'Logs', perApp: true },
   { key: 'cheatsheet', label: 'Cheat Sheet', perApp: false },
 ];
+
+// Auto-refresh cadence for overview data. Configurable via DOKKU_DASH_REFRESH
+// (seconds); 0 disables polling.
+const REFRESH_SECONDS = (() => {
+  const raw = Number(process.env.DOKKU_DASH_REFRESH ?? 30);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+})();
+
+const LOG_CAP = 500;
+
+interface LogLine {
+  text: string;
+  err: boolean;
+}
 
 type Focus = 'menu' | 'content';
 
@@ -57,22 +73,35 @@ function useTerminalSize(): { columns: number; rows: number } {
 // Small presentational pieces
 // ---------------------------------------------------------------------------
 
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 function Loading(): ReactNode {
-  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const [i, setI] = useState(0);
   useEffect(() => {
-    const t = setInterval(() => setI((n) => (n + 1) % frames.length), 90);
+    const t = setInterval(() => setI((n) => (n + 1) % SPINNER.length), 90);
     return () => clearInterval(t);
   }, []);
   return (
     <Box padding={1}>
-      <Text color={theme.accent}>{frames[i]} </Text>
+      <Text color={theme.accent}>{SPINNER[i]} </Text>
       <Text>Loading Dokku data…</Text>
     </Box>
   );
 }
 
-function Header({ source, host, count }: { source: Source; host: string; count: number }): ReactNode {
+function Header({
+  source,
+  host,
+  count,
+  cert,
+  refreshing,
+}: {
+  source: Source;
+  host: string;
+  count: number;
+  cert: { app: string; days: number } | null;
+  refreshing: boolean;
+}): ReactNode {
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Box>
@@ -82,6 +111,12 @@ function Header({ source, host, count }: { source: Source; host: string; count: 
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
       <Box>
+        {refreshing ? <Text color={theme.dim}>↻ </Text> : null}
+        {cert ? (
+          <Text wrap="truncate-end" color={cert.days < 0 ? theme.bad : cert.days <= 14 ? theme.warn : theme.dim}>
+            cert: {cert.app} {cert.days < 0 ? 'expired' : `${cert.days}d`}{'  '}
+          </Text>
+        ) : null}
         <Text color={theme.dim}>
           {count} app{count === 1 ? '' : 's'}{'  '}
         </Text>
@@ -150,10 +185,11 @@ function AppSelector({
 function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode {
   const v = VIEWS[view];
   const keys: Array<[string, string]> = [
-    ['1-5', 'view'],
+    [`1-${VIEWS.length}`, 'view'],
     ['tab', focused === 'menu' ? 'focus list' : 'focus menu'],
-    ['↑↓', focused === 'menu' ? 'change view' : v.perApp ? 'select app' : 'scroll'],
+    ['↑↓', focused === 'menu' ? 'change view' : v.key === 'logs' ? 'scroll logs' : v.perApp ? 'select app' : 'scroll'],
   ];
+  if (v.perApp) keys.push(['←→', 'switch app']);
   if (v.key === 'config') keys.push(['s', 'reveal/hide']);
   keys.push(['r', 'refresh']);
   keys.push(['q', 'quit']);
@@ -181,12 +217,10 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
 
 function AppsView({
   apps,
-  width,
   viewport,
   scroll,
 }: {
   apps: DokkuApp[];
-  width: number;
   viewport: number;
   scroll: number;
 }): ReactNode {
@@ -194,8 +228,8 @@ function AppsView({
   // Fixed-width columns first, then the flexible DOMAIN column last so it can
   // truncate without disturbing alignment. Every cell is truncate-end so a
   // narrow terminal degrades gracefully instead of wrapping the grid.
-  const nameW = 14;
-  const statusW = 10;
+  const nameW = Math.min(28, Math.max(10, ...apps.map((a) => a.name.length)) + 2);
+  const statusW = 16;
   const procW = 16;
   const sslW = 11;
   return (
@@ -224,7 +258,7 @@ function AppsView({
   );
 }
 
-function DomainsView({ app, width }: { app?: DokkuApp; width: number }): ReactNode {
+function DomainsView({ app }: { app?: DokkuApp }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
   const sb = sslBadge(app.ssl);
   const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
@@ -279,7 +313,7 @@ function statusColor(s: string): string {
   return theme.warn;
 }
 
-function ProcessView({ app, width }: { app?: DokkuApp; width: number }): ReactNode {
+function ProcessView({ app }: { app?: DokkuApp }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
   const rb = runningBadge(app);
   return (
@@ -316,7 +350,6 @@ function ConfigView({
   config,
   loading,
   reveal,
-  width,
   viewport,
   scroll,
 }: {
@@ -324,7 +357,6 @@ function ConfigView({
   config?: Record<string, string>;
   loading: boolean;
   reveal: boolean;
-  width: number;
   viewport: number;
   scroll: number;
 }): ReactNode {
@@ -365,6 +397,45 @@ function ConfigView({
         );
       })}
       {scrollHint(entries.length, scroll, viewport)}
+    </Box>
+  );
+}
+
+function LogsView({
+  app,
+  lines,
+  viewport,
+  offset,
+}: {
+  app?: DokkuApp;
+  lines: LogLine[];
+  viewport: number;
+  offset: number; // scrollback distance from the live tail (0 = following)
+}): ReactNode {
+  if (!app) return <Text color={theme.dim}>No app selected.</Text>;
+  const rows = Math.max(1, viewport - 1); // one row reserved for the status line
+  const end = Math.max(0, lines.length - offset);
+  const visible = lines.slice(Math.max(0, end - rows), end);
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {app.name}
+        </Text>
+        <Text color={theme.dim}>
+          {'  '}· dokku logs -t · {lines.length}{lines.length === LOG_CAP ? '+' : ''} lines
+        </Text>
+        {offset > 0 ? <Text color={theme.warn}>  · scrollback ↑{offset} (↓ to follow)</Text> : null}
+      </Text>
+      {visible.length === 0 ? (
+        <Text color={theme.dim}>Waiting for log output…</Text>
+      ) : (
+        visible.map((l, i) => (
+          <Text key={end - visible.length + i} wrap="truncate-end" color={l.err ? theme.warn : theme.text}>
+            {l.text}
+          </Text>
+        ))
+      )}
     </Box>
   );
 }
@@ -442,24 +513,41 @@ export default function App(): ReactNode {
 
   const [data, setData] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [configCache, setConfigCache] = useState<Record<string, Record<string, string>>>({});
   const [configLoading, setConfigLoading] = useState(false);
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
 
   const apps = data ? data.apps : [];
   const source: Source = data ? data.source : 'demo';
   const currentView = VIEWS[view];
   const currentApp: DokkuApp | undefined = apps[selectedApp];
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  // Background refreshes keep the overview live without flashing the spinner
+  // or dropping the lazily-loaded config cache; manual `r` resets both.
+  const refreshInFlight = useRef(false);
+  const refresh = useCallback(async (opts?: { background?: boolean }) => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    setRefreshing(true);
     const result = await loadOverview();
     setData(result);
-    setConfigCache({});
+    if (!opts?.background) setConfigCache({});
     setLoading(false);
+    setRefreshing(false);
+    refreshInFlight.current = false;
   }, []);
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!REFRESH_SECONDS) return;
+    const t = setInterval(() => {
+      void refresh({ background: true });
+    }, REFRESH_SECONDS * 1000);
+    return () => clearInterval(t);
   }, [refresh]);
 
   useEffect(() => {
@@ -469,6 +557,33 @@ export default function App(): ReactNode {
   useEffect(() => {
     if (selectedApp > apps.length - 1) setSelectedApp(Math.max(0, apps.length - 1));
   }, [apps.length, selectedApp]);
+
+  // Tail logs while the Logs view is showing an app. Lines are buffered and
+  // flushed on an interval so a chatty app doesn't re-render per line.
+  const logApp = currentView.key === 'logs' ? currentApp?.name : undefined;
+  useEffect(() => {
+    if (!logApp) return;
+    setLogLines([]);
+    const buf: LogLine[] = [];
+    const flush = setInterval(() => {
+      if (buf.length === 0) return;
+      const chunk = buf.splice(0, buf.length);
+      setLogLines((prev) => {
+        const next = prev.concat(chunk);
+        return next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
+      });
+    }, 150);
+    const stop = tailLogs(
+      logApp,
+      source,
+      (text, err) => buf.push({ text, err }),
+      (msg) => buf.push({ text: msg, err: true }),
+    );
+    return () => {
+      clearInterval(flush);
+      stop();
+    };
+  }, [logApp, source]);
 
   // Lazily load config for the selected app when on the config view.
   useEffect(() => {
@@ -521,6 +636,16 @@ export default function App(): ReactNode {
       return;
     }
 
+    // ←/→ (h/l) always switches the selected app in per-app views, even when
+    // ↑/↓ is busy scrolling long content (e.g. a big config list).
+    const left = key.leftArrow || input === 'h';
+    const right = key.rightArrow || input === 'l';
+    if ((left || right) && currentView.perApp) {
+      setSelectedApp((i) => Math.min(Math.max(0, i + (right ? 1 : -1)), apps.length - 1));
+      setScroll(0);
+      return;
+    }
+
     const up = key.upArrow || input === 'k';
     const down = key.downArrow || input === 'j';
     if (!up && !down) return;
@@ -532,6 +657,12 @@ export default function App(): ReactNode {
     }
     // focus === 'content'
     if (currentView.perApp) {
+      if (currentView.key === 'logs') {
+        // ↑ digs into scrollback, ↓ moves back toward the live tail.
+        const max = Math.max(0, logLines.length - (viewport - 1));
+        setScroll((s) => Math.min(Math.max(0, s + (up ? 1 : -1)), max));
+        return;
+      }
       if (currentView.key === 'config') {
         const total = currentApp ? Object.keys(configCache[currentApp.name] || {}).length : 0;
         if (total > viewport) {
@@ -550,7 +681,7 @@ export default function App(): ReactNode {
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} refreshing={false} />
         <Loading />
       </Box>
     );
@@ -559,13 +690,13 @@ export default function App(): ReactNode {
   let content: ReactNode = null;
   switch (currentView.key) {
     case 'apps':
-      content = <AppsView apps={apps} width={colBudget} viewport={viewport} scroll={scroll} />;
+      content = <AppsView apps={apps} viewport={viewport} scroll={scroll} />;
       break;
     case 'domains':
-      content = <DomainsView app={currentApp} width={colBudget} />;
+      content = <DomainsView app={currentApp} />;
       break;
     case 'process':
-      content = <ProcessView app={currentApp} width={colBudget} />;
+      content = <ProcessView app={currentApp} />;
       break;
     case 'config':
       content = (
@@ -574,11 +705,13 @@ export default function App(): ReactNode {
           config={currentApp ? configCache[currentApp.name] : {}}
           loading={configLoading && !(currentApp && configCache[currentApp.name])}
           reveal={reveal}
-          width={colBudget}
           viewport={viewport}
           scroll={scroll}
         />
       );
+      break;
+    case 'logs':
+      content = <LogsView app={currentApp} lines={logLines} viewport={viewport} offset={scroll} />;
       break;
     case 'cheatsheet':
       content = <CheatsheetView width={colBudget} viewport={viewport} scroll={scroll} />;
@@ -587,7 +720,13 @@ export default function App(): ReactNode {
 
   return (
     <Box flexDirection="column" height={rows}>
-      <Header source={source} host={hostLabel()} count={apps.length} />
+      <Header
+        source={source}
+        host={hostLabel()}
+        count={apps.length}
+        cert={soonestCert(apps)}
+        refreshing={refreshing && !loading}
+      />
       <Box flexGrow={1}>
         <Menu view={view} focused={focus === 'menu'} />
         {currentView.perApp ? (

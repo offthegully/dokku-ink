@@ -22,9 +22,13 @@ test('renders the dashboard with demo data', async () => {
   assert.match(frame, /blog/); // first demo app
   assert.match(frame, /Cheat Sheet/); // menu label
 
-  stdin.write('5'); // Cheat Sheet view
+  stdin.write('6'); // Cheat Sheet view
   await tick(20);
   assert.match(lastFrame() ?? '', /dokku apps:list|Deploy|Process/);
+
+  stdin.write('5'); // Logs view (demo generator)
+  await tick(20);
+  assert.match(lastFrame() ?? '', /dokku logs -t/);
 
   unmount();
 });

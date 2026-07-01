@@ -7,7 +7,7 @@
 // fallbacks. When `dokku` is not on PATH (e.g. local dev), we transparently
 // fall back to rich demo data so every view is still explorable.
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { DEMO } from './demo.js';
 import type {
@@ -78,7 +78,7 @@ function parseAppNames(out: string): string[] {
   const names: string[] = [];
   for (const line of out.split('\n')) {
     const t = line.trim();
-    if (!t || t.startsWith('=====>') || t.startsWith('----') || t.startsWith('!') || t.startsWith('-----')) continue;
+    if (!t || t.startsWith('=====>') || t.startsWith('----') || t.startsWith('!')) continue;
     const tok = t.split(/\s+/)[0];
     if (tok) names.push(tok);
   }
@@ -130,12 +130,14 @@ function pick(obj: Record<string, string> | undefined, ...keys: string[]): strin
 // ---------------------------------------------------------------------------
 
 // Pull the per-process scale + container statuses out of a ps:report entry.
-// Keys look like: "status-web-1": "running (abc123)", "status-worker-1": "..."
+// Dokku derives these keys from its CONTAINER.<type>.<n> files, so they look
+// like "status-web.1": "running (abc123)". Accept a dash separator too for
+// older/alternative shapes.
 function parseProcesses(psEntry: Record<string, string> | undefined): Process[] {
   if (!psEntry) return [];
   const byType = new Map<string, ProcInstance[]>();
   for (const [key, value] of Object.entries(psEntry)) {
-    const m = /^status-(.+)-(\d+)$/.exec(key);
+    const m = /^status-(.+)[.-](\d+)$/.exec(key);
     if (!m) continue;
     const type = m[1];
     const idx = Number(m[2]);
@@ -204,7 +206,9 @@ export async function loadOverview(): Promise<Overview> {
   const domRep: Record<string, Record<string, string>> = {};
   const certRep: Record<string, Record<string, string>> = {};
 
-  await mapLimit(names, 8, async (name) => {
+  // Each worker fires 4 reports in parallel, so this is up to 16 concurrent
+  // dokku invocations — plenty, without hammering the host.
+  await mapLimit(names, 4, async (name) => {
     const [a, ps, dom, cert] = await Promise.all([
       reportForApp('apps', name),
       reportForApp('ps', name),
@@ -289,6 +293,63 @@ export async function loadConfig(appName: string, source: Source): Promise<Confi
 }
 
 // ---------------------------------------------------------------------------
+// Log tailing
+// ---------------------------------------------------------------------------
+
+export type LogSink = (line: string, isErr: boolean) => void;
+
+// Stream `dokku logs <app> -t` line by line. Returns a stop function that
+// kills the child (or the demo generator). `onEnd` fires if the stream dies
+// on its own — e.g. the app has no deployed containers to tail.
+export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (msg: string) => void): () => void {
+  if (source === 'demo') {
+    const paths = ['/', '/health', '/api/items', '/login', '/static/app.css'];
+    let n = 0;
+    const t = setInterval(() => {
+      n++;
+      const status = n % 17 === 0 ? 500 : 200;
+      const ms = Math.abs(Math.round(Math.sin(n) * 20)) + 5;
+      onLine(
+        `${new Date().toISOString()} ${app} web.1: GET ${paths[n % paths.length]} ${status} ${ms}ms`,
+        status >= 500,
+      );
+    }, 600);
+    return () => clearInterval(t);
+  }
+
+  const child = spawn(DOKKU_BIN, ['logs', app, '-t', '-n', '100'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const readLines = (stream: NodeJS.ReadableStream, isErr: boolean) => {
+    let buf = '';
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk: string) => {
+      buf += chunk;
+      let i: number;
+      while ((i = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        if (line.trim()) onLine(line, isErr);
+      }
+    });
+  };
+  readLines(child.stdout, false);
+  readLines(child.stderr, true);
+
+  let stopped = false;
+  child.on('error', (e) => {
+    if (!stopped) onEnd(`log stream failed: ${e.message}`);
+  });
+  child.on('exit', (code, signal) => {
+    if (!stopped) onEnd(`log stream ended (${signal ?? `exit ${code}`})`);
+  });
+  return () => {
+    stopped = true;
+    child.kill('SIGTERM');
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics: `dokku-dash --doctor`
 // ---------------------------------------------------------------------------
 
@@ -313,31 +374,40 @@ export async function runDoctor(): Promise<string> {
   L.push(`  parsed ${names.length} name(s): ${names.join(', ') || '(none)'}`);
   L.push('');
 
+  // Normalize first so the probes can target an app that actually has
+  // containers — probing a never-deployed app shows no status keys and would
+  // hide process-parsing bugs.
+  const ov = await loadOverview();
+  const probe = (ov.source === 'dokku' ? ov.apps.find((a) => a.running)?.name : undefined) ?? names[0];
+
   // Probe the actual strategy: per-app `<plugin>:report <app> --format json`.
-  const first = names[0];
   for (const plugin of ['apps', 'ps', 'domains', 'certs']) {
-    if (!first) break;
-    const r = await dokkuRaw([`${plugin}:report`, first, '--format', 'json']);
+    if (!probe) break;
+    const r = await dokkuRaw([`${plugin}:report`, probe, '--format', 'json']);
     let verdict: string;
     let keys = '';
+    let obj: Record<string, string> | undefined;
     if (!r.ok) {
       verdict = 'FAILED (command errored)';
     } else {
       try {
-        const obj = JSON.parse(r.stdout.trim());
+        obj = JSON.parse(r.stdout.trim());
         verdict = 'OK (valid JSON)';
-        keys = Object.keys(obj).slice(0, 14).join(', ');
+        keys = Object.keys(obj!).slice(0, 20).join(', ');
       } catch (e) {
         verdict = 'NOT valid JSON: ' + (e as Error).message;
       }
     }
-    L.push(`# dokku ${plugin}:report ${first} --format json  ->  ${verdict}`);
-    L.push(indent(clip((r.ok ? r.stdout : r.error || r.stderr).trim(), 300)));
+    L.push(`# dokku ${plugin}:report ${probe} --format json  ->  ${verdict}`);
+    L.push(indent(clip((r.ok ? r.stdout : r.error || r.stderr).trim(), plugin === 'ps' ? 900 : 300)));
     if (keys) L.push(`  keys: ${keys}`);
+    if (plugin === 'ps' && obj) {
+      const procs = parseProcesses(obj);
+      L.push(`  parsed processes: ${procs.map((p) => `${p.type}×${p.scale}`).join(', ') || '(none)'}`);
+    }
     L.push('');
   }
 
-  const ov = await loadOverview();
   L.push(`# loadOverview()  ->  source=${ov.source}, apps=${ov.apps.length}`);
   L.push(
     indent(

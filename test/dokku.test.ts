@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApps, toBool } from '../src/dokku.js';
-import { sslBadge, runningBadge } from '../src/ui.js';
+import { sslBadge, runningBadge, soonestCert } from '../src/ui.js';
 import type { RawReport } from '../src/types.js';
 
 // Sample shaped like real `dokku <plugin>:report --format json` output
@@ -78,11 +78,12 @@ test('buildApps handles a stopped app with no SSL', () => {
 
 test('buildApps parses Dokku 0.38 per-app report shapes', () => {
   // 0.38 quirks: certs use `enabled`/`issuer` (no ssl- prefix), ps exposes
-  // `computed-restart-policy`, domains carry `app-vhosts`.
+  // `computed-restart-policy`, domains carry `app-vhosts`, and process status
+  // keys are dot-separated (`status-web.1`, from CONTAINER.web.1 files).
   const apps = buildApps(
     ['x'],
     { x: { 'created-at': '1781837404', 'deploy-source': '', dir: '/home/dokku/x' } },
-    { x: { deployed: 'true', running: 'true', 'computed-restart-policy': 'on-failure:10', 'status-web-1': 'running (abc)' } },
+    { x: { deployed: 'true', running: 'true', 'computed-restart-policy': 'on-failure:10', 'status-web.1': 'running (abc)', 'status-web.2': 'running (def)' } },
     { x: { 'app-enabled': 'true', 'app-vhosts': 'x.example.com', 'global-vhosts': 'example.com' } },
     { x: { dir: '/home/dokku/x/tls', enabled: 'false', hostnames: '', issuer: '' } },
   );
@@ -90,6 +91,7 @@ test('buildApps parses Dokku 0.38 per-app report shapes', () => {
   assert.equal(a.running, true);
   assert.equal(a.restartPolicy, 'on-failure:10');
   assert.equal(a.processes[0].type, 'web');
+  assert.equal(a.processes[0].scale, 2);
   assert.deepEqual(a.domains, ['x.example.com']);
   assert.equal(a.domainsEnabled, true);
   assert.equal(a.ssl, null); // enabled:false -> null
@@ -105,9 +107,12 @@ test('buildApps is resilient to missing reports', () => {
 });
 
 test('badges classify state correctly', () => {
-  assert.equal(runningBadge({ running: true }).color, 'green');
-  assert.equal(runningBadge({ running: false }).color, 'red');
-  assert.equal(runningBadge({ running: null }).color, 'gray');
+  assert.equal(runningBadge({ running: true, deployed: true }).color, 'green');
+  assert.equal(runningBadge({ running: false, deployed: true }).color, 'red');
+  assert.equal(runningBadge({ running: null, deployed: false }).color, 'gray');
+  const nd = runningBadge({ running: false, deployed: false });
+  assert.match(nd.text, /not deployed/);
+  assert.equal(nd.color, 'gray');
 
   assert.match(
     sslBadge({ enabled: true, issuer: "Let's Encrypt", hostnames: [], startsAt: null, verified: true, expiresAt: '2099-01-01' }).text,
@@ -118,4 +123,13 @@ test('badges classify state correctly', () => {
     sslBadge({ enabled: true, issuer: null, hostnames: [], startsAt: null, verified: null, expiresAt: '2000-01-01' }).text.includes('expired'),
     true,
   );
+});
+
+test('soonestCert picks the certificate expiring first', () => {
+  const apps = buildApps(['blog', 'staging'], appsRep, psRep, domRep, certRep);
+  // Only blog has an enabled cert (2099) -> it wins; staging's disabled cert is ignored.
+  const s = soonestCert(apps);
+  assert.equal(s?.app, 'blog');
+  assert.ok(s!.days > 0);
+  assert.equal(soonestCert([]), null);
 });

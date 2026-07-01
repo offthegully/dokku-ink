@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // Entry point: parse a couple of flags, then render the Ink app.
 
+import { createRequire } from 'node:module';
 import { render } from 'ink';
 import App from './App.js';
+
+// Works from both src/ (tsx/bun) and dist/ (compiled) — one level below the
+// package root either way.
+const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 const args = process.argv.slice(2);
 
@@ -11,7 +16,7 @@ if (args.includes('--help') || args.includes('-h')) {
   process.exit(0);
 }
 if (args.includes('--version') || args.includes('-v')) {
-  console.log('dokku-dash 0.1.0');
+  console.log(`dokku-dash ${version}`);
   process.exit(0);
 }
 if (args.includes('--doctor') || args.includes('doctor')) {
@@ -46,17 +51,19 @@ OPTIONS
   -v, --version  Show version
 
 KEYS (inside the dashboard)
-  1-5            Jump to a view
-  ↑ / ↓ (j/k)    Move within the focused pane
+  1-6            Jump to a view
+  ↑ / ↓ (j/k)    Move within the focused pane (scrollback in Logs)
+  ← / → (h/l)    Switch app (in per-app views)
   tab            Toggle focus between the menu and the list/content
   s              Reveal / hide values (Config view)
   r              Refresh data from Dokku
   q / Ctrl-C     Quit
 
 ENV
-  DOKKU_DASH_BIN    Path to the dokku binary (default: dokku)
-  DOKKU_DASH_HOST   Label shown in the header (default: hostname)
-  DOKKU_DASH_DEMO   Set to 1 to force demo data
+  DOKKU_DASH_BIN      Path to the dokku binary (default: dokku)
+  DOKKU_DASH_HOST     Label shown in the header (default: hostname)
+  DOKKU_DASH_DEMO     Set to 1 to force demo data
+  DOKKU_DASH_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
 
 Run this directly on your Dokku host; it shells out to the local
 \`dokku\` CLI (read-only) — no REST API or extra services needed.`);

@@ -12,9 +12,10 @@ This first version is **read-only**: it visualizes state and ships a built-in ch
 │   2 Domains & SSL││ blog        ● running web×2 worker×1 LE ✔   blog.…  +1 │
 │   3 Processes    ││ api         ● running web×3          LE ✔   api.example│
 │   4 Config / Env ││ staging     ○ stopped web×1          none   staging.…  │
-│   5 Cheat Sheet  ││ metrics     ● running web×1          LE 4d… metrics.…  │
+│   5 Logs         ││ metrics     ● running web×1          LE 4d… metrics.…  │
+│   6 Cheat Sheet  ││                                                        │
 ╰──────────────────╯╰───────────────────────────────────────────────────────╯
- 1-5 view   tab focus list   ↑↓ change view   r refresh   q quit
+ 1-6 view   tab focus list   ↑↓ change view   r refresh   q quit
 ```
 
 ## Why no REST API?
@@ -83,8 +84,9 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 
 | Key            | Action                                        |
 | -------------- | --------------------------------------------- |
-| `1`–`5`        | Jump to a view                                |
-| `↑` / `↓` (`j`/`k`) | Move within the focused pane             |
+| `1`–`6`        | Jump to a view                                |
+| `↑` / `↓` (`j`/`k`) | Move within the focused pane (scrollback in Logs) |
+| `←` / `→` (`h`/`l`) | Switch app (in per-app views)            |
 | `tab`          | Toggle focus between the menu and the list    |
 | `s`            | Reveal / hide values (Config view)            |
 | `r`            | Refresh data from Dokku                       |
@@ -96,6 +98,7 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 - **Domains & SSL** — per-app vhosts, routing enabled/disabled, and certificate issuer + expiry (highlighted when expiring within 14 days).
 - **Processes** — per-process scale and individual container statuses, plus restart policy.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
+- **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted).
 - **Cheat Sheet** — a scrollable reference of the most useful `dokku` commands, grouped by area.
 
 ## Troubleshooting
@@ -121,16 +124,15 @@ with your Dokku version.
 | `DOKKU_DASH_BIN`    | `dokku`    | Path to the `dokku` binary               |
 | `DOKKU_DASH_HOST`   | hostname   | Label shown in the header                |
 | `DOKKU_DASH_DEMO`   | –          | Set to `1` to force demo data            |
+| `DOKKU_DASH_REFRESH`| `30`       | Auto-refresh interval in seconds (`0` disables) |
 
 ## How it reads data
 
-On launch (and on `r`) it runs, read-only:
+On launch, on `r`, and every `DOKKU_DASH_REFRESH` seconds (background, no
+spinner) it runs, read-only:
 
-- `dokku apps:list --quiet`
-- `dokku apps:report --format json`
-- `dokku ps:report --format json`
-- `dokku domains:report --format json`
-- `dokku certs:report --format json`
+- `dokku apps:list`
+- then, per app (bounded concurrency): `dokku apps:report <app> --format json`, `dokku ps:report <app> --format json`, `dokku domains:report <app> --format json`, `dokku certs:report <app> --format json`
 
 Config is loaded lazily per app via `dokku config:show <app>` (JSON when available). Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
 
@@ -162,7 +164,7 @@ test/            parsing + render tests
 
 ## Roadmap ideas
 
-Read-only today by design. Natural next steps: log tailing (`dokku logs -t`), datastore/service views (postgres/redis), one-key actions (restart/rebuild) behind a confirmation, and an optional remote mode via a small API on the host.
+Read-only today by design. Natural next steps: datastore/service views (postgres/redis), one-key actions (restart/rebuild) behind a confirmation, and an optional remote mode via a small API on the host.
 
 ## License
 
