@@ -85,16 +85,33 @@ function parseAppNames(out: string): string[] {
   return names;
 }
 
-// Try to parse a `--format json` report. Returns an object keyed by app name,
-// or null when the command/flag is unavailable or output is not JSON.
-async function jsonReport(plugin: string): Promise<RawReport> {
+// Fetch a single app's `--format json` report. On Dokku 0.38+ the no-arg form
+// emits one JSON object *per app per line* (NDJSON) with no app key, which is
+// ambiguous to map back; calling per app returns one clean object we can attach
+// to that exact app. Returns undefined when the command errors or isn't JSON.
+async function reportForApp(plugin: string, app: string): Promise<Record<string, string> | undefined> {
+  const r = await dokkuRaw([`${plugin}:report`, app, '--format', 'json']);
+  if (!r.ok) return undefined;
   try {
-    const out = await dokku([`${plugin}:report`, '--format', 'json']);
-    const parsed = JSON.parse(out);
-    return parsed && typeof parsed === 'object' ? (parsed as RawReport) : null;
+    const obj = JSON.parse(r.stdout.trim());
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? (obj as Record<string, string>) : undefined;
   } catch {
-    return null;
+    return undefined;
   }
+}
+
+// Run an async fn over items with bounded concurrency (keeps process fan-out
+// reasonable on hosts with many apps: N apps × 4 reports).
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T, i: number) => Promise<void>): Promise<void> {
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = idx++;
+      if (i >= items.length) break;
+      await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
 }
 
 export function toBool(v: unknown): boolean {
@@ -181,14 +198,24 @@ export async function loadOverview(): Promise<Overview> {
     warnings.push(`apps:list failed: ${listed.error ?? listed.stderr}`);
   }
 
-  const [appsRep, psRep, domRep, certRep] = await Promise.all([
-    jsonReport('apps'),
-    jsonReport('ps'),
-    jsonReport('domains'),
-    jsonReport('certs'),
-  ]);
+  // Fetch each report per app (see reportForApp) and key the results by app.
+  const appsRep: Record<string, Record<string, string>> = {};
+  const psRep: Record<string, Record<string, string>> = {};
+  const domRep: Record<string, Record<string, string>> = {};
+  const certRep: Record<string, Record<string, string>> = {};
 
-  if (names.length === 0 && appsRep) names = Object.keys(appsRep);
+  await mapLimit(names, 8, async (name) => {
+    const [a, ps, dom, cert] = await Promise.all([
+      reportForApp('apps', name),
+      reportForApp('ps', name),
+      reportForApp('domains', name),
+      reportForApp('certs', name),
+    ]);
+    if (a) appsRep[name] = a;
+    if (ps) psRep[name] = ps;
+    if (dom) domRep[name] = dom;
+    if (cert) certRep[name] = cert;
+  });
 
   const apps = buildApps(names, appsRep, psRep, domRep, certRep);
   return { apps, source: 'dokku', warnings };
@@ -217,7 +244,7 @@ export function buildApps(
       deployed: toBool(pick(ps, 'deployed')),
       deploySource: pick(a, 'deploy-source', 'deploy-source-metadata') || null,
       createdAt: pick(a, 'created-at') || null,
-      restartPolicy: pick(ps, 'restart-policy') || null,
+      restartPolicy: pick(ps, 'restart-policy', 'computed-restart-policy') || null,
       processes: parseProcesses(ps),
       domains: splitHosts(pick(dom, 'app-vhosts')),
       domainsEnabled: appEnabled === undefined ? null : toBool(appEnabled),
@@ -286,24 +313,27 @@ export async function runDoctor(): Promise<string> {
   L.push(`  parsed ${names.length} name(s): ${names.join(', ') || '(none)'}`);
   L.push('');
 
+  // Probe the actual strategy: per-app `<plugin>:report <app> --format json`.
+  const first = names[0];
   for (const plugin of ['apps', 'ps', 'domains', 'certs']) {
-    const r = await dokkuRaw([`${plugin}:report`, '--format', 'json']);
+    if (!first) break;
+    const r = await dokkuRaw([`${plugin}:report`, first, '--format', 'json']);
     let verdict: string;
-    let appsInReport = '';
+    let keys = '';
     if (!r.ok) {
       verdict = 'FAILED (command errored)';
     } else {
       try {
-        const obj = JSON.parse(r.stdout);
+        const obj = JSON.parse(r.stdout.trim());
         verdict = 'OK (valid JSON)';
-        appsInReport = Object.keys(obj).join(', ');
+        keys = Object.keys(obj).slice(0, 14).join(', ');
       } catch (e) {
-        verdict = 'command ran but output is NOT valid JSON: ' + (e as Error).message;
+        verdict = 'NOT valid JSON: ' + (e as Error).message;
       }
     }
-    L.push(`# dokku ${plugin}:report --format json  ->  ${verdict}`);
+    L.push(`# dokku ${plugin}:report ${first} --format json  ->  ${verdict}`);
     L.push(indent(clip((r.ok ? r.stdout : r.error || r.stderr).trim(), 300)));
-    if (appsInReport) L.push(`  apps in report: ${appsInReport}`);
+    if (keys) L.push(`  keys: ${keys}`);
     L.push('');
   }
 

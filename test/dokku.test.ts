@@ -76,6 +76,25 @@ test('buildApps handles a stopped app with no SSL', () => {
   assert.equal(s.ssl, null); // ssl-enabled false -> normalised to null
 });
 
+test('buildApps parses Dokku 0.38 per-app report shapes', () => {
+  // 0.38 quirks: certs use `enabled`/`issuer` (no ssl- prefix), ps exposes
+  // `computed-restart-policy`, domains carry `app-vhosts`.
+  const apps = buildApps(
+    ['x'],
+    { x: { 'created-at': '1781837404', 'deploy-source': '', dir: '/home/dokku/x' } },
+    { x: { deployed: 'true', running: 'true', 'computed-restart-policy': 'on-failure:10', 'status-web-1': 'running (abc)' } },
+    { x: { 'app-enabled': 'true', 'app-vhosts': 'x.example.com', 'global-vhosts': 'example.com' } },
+    { x: { dir: '/home/dokku/x/tls', enabled: 'false', hostnames: '', issuer: '' } },
+  );
+  const a = apps[0];
+  assert.equal(a.running, true);
+  assert.equal(a.restartPolicy, 'on-failure:10');
+  assert.equal(a.processes[0].type, 'web');
+  assert.deepEqual(a.domains, ['x.example.com']);
+  assert.equal(a.domainsEnabled, true);
+  assert.equal(a.ssl, null); // enabled:false -> null
+});
+
 test('buildApps is resilient to missing reports', () => {
   const apps = buildApps(['ghost'], null, null, null, null);
   assert.equal(apps.length, 1);
