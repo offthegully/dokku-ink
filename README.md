@@ -58,6 +58,27 @@ dokku-dash --demo     # sample data, no Dokku required
 dokku-dash --help
 ```
 
+## Running with Bun
+
+Bun executes TypeScript directly, so **don't use `tsx` under Bun** — `tsx` is a
+Node-only loader and running it via Bun fails with
+`Cannot find module './cjs/index.cjs'`. Instead run the source (or the build)
+with Bun itself:
+
+```bash
+bun install
+bun run dev:bun          # dev from source:  bun src/index.tsx
+bun run demo:bun         # demo from source: bun src/index.tsx --demo
+
+# or build once and run the compiled output (most robust for a server):
+bun run build            # tsc compiles to dist/
+bun dist/index.js        # or: node dist/index.js
+```
+
+`bun run dev` / `bun run demo` intentionally use `tsx` (the Node path) and will
+not work under Bun — use the `:bun` variants above. If the interactive UI ever
+misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
+
 ### Keys
 
 | Key            | Action                                        |
