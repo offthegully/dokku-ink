@@ -14,6 +14,11 @@ if (args.includes('--version') || args.includes('-v')) {
   console.log('dokku-dash 0.1.0');
   process.exit(0);
 }
+if (args.includes('--doctor') || args.includes('doctor')) {
+  const { runDoctor } = await import('./dokku.js');
+  console.log(await runDoctor());
+  process.exit(0);
+}
 if (args.includes('--demo')) {
   process.env.DOKKU_DASH_DEMO = '1';
 }
@@ -36,6 +41,7 @@ USAGE
 
 OPTIONS
   --demo         Show demo data (no Dokku required)
+  --doctor       Probe the dokku CLI and print diagnostics (no TUI)
   -h, --help     Show this help
   -v, --version  Show version
 

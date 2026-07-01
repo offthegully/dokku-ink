@@ -98,6 +98,22 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
 - **Cheat Sheet** — a scrollable reference of the most useful `dokku` commands, grouped by area.
 
+## Troubleshooting
+
+If the dashboard shows no apps (or looks empty), run the built-in probe — it
+prints exactly what your Dokku returns for each command and whether the tool
+could parse it, without launching the TUI:
+
+```bash
+dokku-dash --doctor
+# from source:  bun src/index.tsx --doctor   (or)   npx tsx src/index.tsx --doctor
+```
+
+The output shows `dokku version`, `apps:list`, and each `--format json` report,
+plus the final normalized result (`loadOverview() -> source=…, apps=…`). If a
+report says "NOT valid JSON" or a command FAILED, that pinpoints the mismatch
+with your Dokku version.
+
 ## Configuration
 
 | Env var             | Default    | Purpose                                  |

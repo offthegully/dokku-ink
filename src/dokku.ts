@@ -51,6 +51,40 @@ async function dokku(args: string[]): Promise<string> {
   return stdout;
 }
 
+interface RawResult {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  error?: string;
+}
+
+// Like dokku() but never throws — captures stdout/stderr/error for diagnostics.
+async function dokkuRaw(args: string[]): Promise<RawResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync(DOKKU_BIN, args, {
+      timeout: 20000,
+      maxBuffer: 1024 * 1024 * 16,
+    });
+    return { ok: true, stdout, stderr };
+  } catch (e) {
+    const err = e as { stdout?: string; stderr?: string; message?: string };
+    return { ok: false, stdout: err.stdout ?? '', stderr: err.stderr ?? '', error: err.message ?? String(e) };
+  }
+}
+
+// Parse `dokku apps:list` output into app names, tolerant of the "=====> My Apps"
+// header and of names being newline- or whitespace-separated.
+function parseAppNames(out: string): string[] {
+  const names: string[] = [];
+  for (const line of out.split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('=====>') || t.startsWith('----') || t.startsWith('!') || t.startsWith('-----')) continue;
+    const tok = t.split(/\s+/)[0];
+    if (tok) names.push(tok);
+  }
+  return names;
+}
+
 // Try to parse a `--format json` report. Returns an object keyed by app name,
 // or null when the command/flag is unavailable or output is not JSON.
 async function jsonReport(plugin: string): Promise<RawReport> {
@@ -139,12 +173,12 @@ export async function loadOverview(): Promise<Overview> {
   const warnings: string[] = [];
   let names: string[] = [];
 
-  // App names. Prefer apps:list --quiet (one name per line).
-  try {
-    const out = await dokku(['apps:list', '--quiet']);
-    names = out.split('\n').map((s) => s.trim()).filter(Boolean);
-  } catch (e) {
-    warnings.push(`apps:list failed: ${(e as Error).message}`);
+  // App names from `dokku apps:list` (header-tolerant parsing; no --quiet needed).
+  const listed = await dokkuRaw(['apps:list']);
+  if (listed.ok) {
+    names = parseAppNames(listed.stdout);
+  } else {
+    warnings.push(`apps:list failed: ${listed.error ?? listed.stderr}`);
   }
 
   const [appsRep, psRep, domRep, certRep] = await Promise.all([
@@ -225,4 +259,69 @@ export async function loadConfig(appName: string, source: Source): Promise<Confi
     return { vars: {}, source: 'dokku', error: (e as Error).message };
   }
   return { vars, source: 'dokku' };
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: `dokku-dash --doctor`
+// ---------------------------------------------------------------------------
+
+const indent = (s: string) => s.split('\n').map((l) => '  ' + l).join('\n');
+const clip = (s: string, n = 500) => (s.length > n ? s.slice(0, n) + '\n  …(truncated)' : s);
+
+export async function runDoctor(): Promise<string> {
+  const L: string[] = [];
+  L.push('dokku-dash doctor');
+  L.push(`binary: ${DOKKU_BIN}   (override with DOKKU_DASH_BIN)`);
+  L.push('');
+
+  const v = await dokkuRaw(['version']);
+  L.push(`# dokku version  ->  ${v.ok ? 'OK' : 'FAILED'}`);
+  L.push(indent(clip((v.stdout || v.stderr || v.error || '').trim(), 200)));
+  L.push('');
+
+  const al = await dokkuRaw(['apps:list']);
+  L.push(`# dokku apps:list  ->  ${al.ok ? 'OK' : 'FAILED'}`);
+  L.push(indent(clip((al.ok ? al.stdout : al.error || al.stderr).trim(), 400)));
+  const names = al.ok ? parseAppNames(al.stdout) : [];
+  L.push(`  parsed ${names.length} name(s): ${names.join(', ') || '(none)'}`);
+  L.push('');
+
+  for (const plugin of ['apps', 'ps', 'domains', 'certs']) {
+    const r = await dokkuRaw([`${plugin}:report`, '--format', 'json']);
+    let verdict: string;
+    let appsInReport = '';
+    if (!r.ok) {
+      verdict = 'FAILED (command errored)';
+    } else {
+      try {
+        const obj = JSON.parse(r.stdout);
+        verdict = 'OK (valid JSON)';
+        appsInReport = Object.keys(obj).join(', ');
+      } catch (e) {
+        verdict = 'command ran but output is NOT valid JSON: ' + (e as Error).message;
+      }
+    }
+    L.push(`# dokku ${plugin}:report --format json  ->  ${verdict}`);
+    L.push(indent(clip((r.ok ? r.stdout : r.error || r.stderr).trim(), 300)));
+    if (appsInReport) L.push(`  apps in report: ${appsInReport}`);
+    L.push('');
+  }
+
+  const ov = await loadOverview();
+  L.push(`# loadOverview()  ->  source=${ov.source}, apps=${ov.apps.length}`);
+  L.push(
+    indent(
+      ov.apps
+        .map(
+          (a) =>
+            `${a.name}  running=${a.running}  procs=${a.processes.map((p) => `${p.type}x${p.scale}`).join(',') || '-'}  domains=${a.domains.join(' ') || '-'}  ssl=${a.ssl ? 'yes' : 'no'}`,
+        )
+        .join('\n') || '(no apps)',
+    ),
+  );
+  if (ov.warnings.length) {
+    L.push('warnings:');
+    L.push(indent(ov.warnings.join('\n')));
+  }
+  return L.join('\n');
 }
