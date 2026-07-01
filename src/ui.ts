@@ -34,6 +34,13 @@ export function fmtDate(iso: string | null | undefined): string {
   return d.toISOString().slice(0, 10);
 }
 
+// Compact "time since" for the header freshness readout.
+export function fmtAge(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
 export function daysUntil(iso: string | null | undefined): number | null {
   if (!iso) return null;
   const d = new Date(iso);

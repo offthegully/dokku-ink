@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildApps, toBool } from '../src/dokku.js';
-import { sslBadge, runningBadge, soonestCert, leadingTimestamp } from '../src/ui.js';
+import { fmtAge, sslBadge, runningBadge, soonestCert, leadingTimestamp } from '../src/ui.js';
 import type { RawReport } from '../src/types.js';
 
 // Sample shaped like real `dokku <plugin>:report --format json` output
@@ -123,6 +123,14 @@ test('badges classify state correctly', () => {
     sslBadge({ enabled: true, issuer: null, hostnames: [], startsAt: null, verified: null, expiresAt: '2000-01-01' }).text.includes('expired'),
     true,
   );
+});
+
+test('fmtAge formats compact durations', () => {
+  assert.equal(fmtAge(0), '0s');
+  assert.equal(fmtAge(59), '59s');
+  assert.equal(fmtAge(60), '1m');
+  assert.equal(fmtAge(3599), '59m');
+  assert.equal(fmtAge(7200), '2h');
 });
 
 test('leadingTimestamp extracts and orders docker -t timestamps', () => {

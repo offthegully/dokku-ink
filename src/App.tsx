@@ -7,6 +7,7 @@ import {
   theme,
   truncate,
   padEnd,
+  fmtAge,
   fmtDate,
   daysUntil,
   leadingTimestamp,
@@ -15,7 +16,7 @@ import {
   sslBadge,
   windowed,
 } from './ui.js';
-import { loadOverview, loadConfig, tailLogs } from './dokku.js';
+import { loadOverview, loadConfig, tailLogs, watchEvents } from './dokku.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type { DokkuApp, Overview, Source } from './types.js';
 
@@ -40,6 +41,10 @@ const REFRESH_SECONDS = (() => {
   const raw = Number(process.env.DOKKU_DASH_REFRESH ?? 30);
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
 })();
+// The view you're staring at should feel closer to real time: while the
+// Processes view is open, poll on a tighter leash (never slower than the
+// configured cadence, never faster than 10s).
+const FAST_REFRESH_SECONDS = REFRESH_SECONDS ? Math.min(10, REFRESH_SECONDS) : 0;
 
 const LOG_CAP = 500;
 // Keep per-app log buffers around after leaving the view, so flipping between
@@ -99,13 +104,17 @@ function Header({
   count,
   cert,
   refreshing,
+  age,
 }: {
   source: Source;
   host: string;
   count: number;
   cert: { app: string; days: number } | null;
   refreshing: boolean;
+  age: number | null; // seconds since the last successful refresh
 }): ReactNode {
+  // Fixed-width slot so the readout never nudges the rest of the header.
+  const fresh = refreshing ? '↻ …' : age !== null ? `↻ ${fmtAge(age)}` : '';
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Box>
@@ -115,7 +124,7 @@ function Header({
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
       <Box>
-        <Text color={theme.dim}>{refreshing ? '↻ ' : '  '}</Text>
+        <Text color={refreshing ? theme.accent : theme.dim}>{padEnd(fresh, 8)}</Text>
         {cert ? (
           <Text wrap="truncate-end" color={cert.days < 0 ? theme.bad : cert.days <= 14 ? theme.warn : theme.dim}>
             cert: {cert.app} {cert.days < 0 ? 'expired' : `${cert.days}d`}{'  '}
@@ -522,7 +531,11 @@ export default function App(): ReactNode {
   const [data, setData] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [configCache, setConfigCache] = useState<Record<string, Record<string, string>>>({});
+  // Bumped on every successful refresh; config entries carry the version they
+  // were fetched under, so stale ones refetch silently on the next look.
+  const [dataV, setDataV] = useState(0);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  const [configCache, setConfigCache] = useState<Record<string, { vars: Record<string, string>; v: number }>>({});
   const [configLoading, setConfigLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
 
@@ -531,16 +544,18 @@ export default function App(): ReactNode {
   const currentView = VIEWS[view];
   const currentApp: DokkuApp | undefined = apps[selectedApp];
 
-  // Background refreshes keep the overview live without flashing the spinner
-  // or dropping the lazily-loaded config cache; manual `r` resets both.
+  // One refresh path for launch, `r`, the poll timer and pushed events — it
+  // never flashes the spinner and never drops caches; versioning (dataV)
+  // invalidates config entries instead.
   const refreshInFlight = useRef(false);
-  const refresh = useCallback(async (opts?: { background?: boolean }) => {
+  const refresh = useCallback(async () => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     setRefreshing(true);
     const result = await loadOverview();
     setData(result);
-    if (!opts?.background) setConfigCache({});
+    setDataV((v) => v + 1);
+    setLastUpdated(Date.now());
     setLoading(false);
     setRefreshing(false);
     refreshInFlight.current = false;
@@ -550,13 +565,40 @@ export default function App(): ReactNode {
     void refresh();
   }, [refresh]);
 
+  const pollSeconds = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
   useEffect(() => {
-    if (!REFRESH_SECONDS) return;
+    if (!pollSeconds) return;
     const t = setInterval(() => {
-      void refresh({ background: true });
-    }, REFRESH_SECONDS * 1000);
+      void refresh();
+    }, pollSeconds * 1000);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [refresh, pollSeconds]);
+
+  // Event-driven refresh: deploys/restarts/scaling show up within ~2s instead
+  // of waiting out the poll. Needs `dokku events:on`; otherwise the watcher
+  // dies instantly and polling carries on alone.
+  useEffect(() => {
+    if (source !== 'dokku') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const stop = watchEvents(() => {
+      if (timer) return; // a deploy emits a burst of events — refresh once
+      timer = setTimeout(() => {
+        timer = null;
+        void refresh();
+      }, 2000);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      stop();
+    };
+  }, [source, refresh]);
+
+  // 1s tick so the "↻ 12s" freshness readout in the header stays honest.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   useEffect(() => {
     setScroll(0);
@@ -612,21 +654,24 @@ export default function App(): ReactNode {
     };
   }, [logApp, source]);
 
-  // Lazily load config for the selected app when on the config view.
+  // Lazily load config for the selected app when on the config view. An entry
+  // fetched under an older dataV refetches silently (stale values stay on
+  // screen meanwhile) so the view tracks `r`, the poll and pushed events.
   useEffect(() => {
     if (currentView.key !== 'config' || !currentApp) return;
-    if (configCache[currentApp.name]) return;
+    const entry = configCache[currentApp.name];
+    if (entry && entry.v === dataV) return;
     let cancelled = false;
-    setConfigLoading(true);
+    if (!entry) setConfigLoading(true);
     void loadConfig(currentApp.name, source).then((res) => {
       if (cancelled) return;
-      setConfigCache((c) => ({ ...c, [currentApp.name]: res.vars }));
+      setConfigCache((c) => ({ ...c, [currentApp.name]: { vars: res.vars, v: dataV } }));
       setConfigLoading(false);
     });
     return () => {
       cancelled = true;
     };
-  }, [currentView.key, currentApp, source, configCache]);
+  }, [currentView.key, currentApp, source, configCache, dataV]);
 
   // Layout sizing. Boxes get explicit widths that sum to `columns` so nothing
   // overflows; `colBudget` is the usable text width inside the content pane
@@ -691,7 +736,7 @@ export default function App(): ReactNode {
         return;
       }
       if (currentView.key === 'config') {
-        const total = currentApp ? Object.keys(configCache[currentApp.name] || {}).length : 0;
+        const total = currentApp ? Object.keys(configCache[currentApp.name]?.vars || {}).length : 0;
         if (total > viewport) {
           clampScroll(delta, total);
           return;
@@ -708,7 +753,7 @@ export default function App(): ReactNode {
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} cert={null} refreshing={false} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} refreshing={false} age={null} />
         <Loading />
       </Box>
     );
@@ -729,7 +774,7 @@ export default function App(): ReactNode {
       content = (
         <ConfigView
           app={currentApp}
-          config={currentApp ? configCache[currentApp.name] : {}}
+          config={currentApp ? configCache[currentApp.name]?.vars : {}}
           loading={configLoading && !(currentApp && configCache[currentApp.name])}
           reveal={reveal}
           viewport={viewport}
@@ -753,6 +798,7 @@ export default function App(): ReactNode {
         count={apps.length}
         cert={soonestCert(apps)}
         refreshing={refreshing && !loading}
+        age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
       <Box flexGrow={1}>
         <Menu view={view} focused={focus === 'menu'} />

@@ -353,6 +353,37 @@ export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (m
   };
 }
 
+// Push-based refresh: follow `dokku events -t` (requires `dokku events:on`)
+// and report each event line as it lands. When events logging is disabled or
+// the plugin is missing the child exits straight away — `onUnavailable` fires
+// once and the caller just stays on polling.
+export function watchEvents(onEvent: (line: string) => void, onUnavailable?: () => void): () => void {
+  const child = spawn(DOKKU_BIN, ['events', '-t'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let stopped = false;
+  let buf = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    buf += chunk;
+    let i: number;
+    while ((i = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line && !stopped) onEvent(line);
+    }
+  });
+  const dead = () => {
+    if (stopped) return;
+    stopped = true;
+    onUnavailable?.();
+  };
+  child.on('error', dead);
+  child.on('exit', dead);
+  return () => {
+    stopped = true;
+    child.kill('SIGTERM');
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics: `dokku-dash --doctor`
 // ---------------------------------------------------------------------------
@@ -409,6 +440,15 @@ export async function runDoctor(): Promise<string> {
       const procs = parseProcesses(obj);
       L.push(`  parsed processes: ${procs.map((p) => `${p.type}×${p.scale}`).join(', ') || '(none)'}`);
     }
+    L.push('');
+  }
+
+  if (ov.source === 'dokku') {
+    const ev = await dokkuRaw(['events']);
+    L.push(
+      `# dokku events  ->  ${ev.ok ? 'OK — event-driven refresh active' : 'unavailable — run `dokku events:on` for push refresh (polling still works)'}`,
+    );
+    L.push(indent(clip((ev.ok ? ev.stdout : ev.error || ev.stderr).trim(), 300)));
     L.push('');
   }
 

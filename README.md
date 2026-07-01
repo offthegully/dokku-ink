@@ -134,7 +134,13 @@ spinner) it runs, read-only:
 - `dokku apps:list`
 - then, per app (bounded concurrency): `dokku apps:report <app> --format json`, `dokku ps:report <app> --format json`, `dokku domains:report <app> --format json`, `dokku certs:report <app> --format json`
 
-Config is loaded lazily per app via `dokku config:show <app>` (JSON when available). Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
+Config is loaded lazily per app via `dokku config:show <app>` (JSON when available) and silently refetched after each refresh, so the Config view tracks reality too. Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
+
+Three things make it feel live rather than polled:
+
+- **Fast lane** — while the Processes view is open it polls every 10s (never slower than your configured cadence), so container status changes show up quickly.
+- **Event push** — if Dokku's events log is enabled (`dokku events:on`), it also follows `dokku events -t` and refreshes within ~2s of a deploy, restart or scale. Without it, polling carries on alone; `--doctor` tells you which mode you're in.
+- **Freshness readout** — the header shows `↻ 12s` (time since the last successful refresh), so the LIVE badge is verifiable at a glance.
 
 ## Development
 
