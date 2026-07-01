@@ -16,7 +16,7 @@ import {
   sslBadge,
   windowed,
 } from './ui.js';
-import { loadOverview, loadConfig, tailLogs, watchEvents } from './dokku.js';
+import { loadOverview, loadConfig, runCommand, tailLogs, watchEvents } from './dokku.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type { DokkuApp, Overview, Source } from './types.js';
 
@@ -50,6 +50,8 @@ const LOG_CAP = 500;
 // Keep per-app log buffers around after leaving the view, so flipping between
 // apps (or views) and back doesn't drop scrollback or re-replay history.
 const LOG_CACHE_TTL_MS = 5 * 60_000;
+// Output kept for a `:` command — deploys/rebuilds stream a lot of lines.
+const CMD_CAP = 1000;
 
 interface LogLine {
   text: string;
@@ -204,6 +206,7 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
   ];
   if (v.perApp) keys.push(['←→', 'switch app']);
   if (v.key === 'config') keys.push(['s', 'reveal/hide']);
+  keys.push([':', 'command']);
   keys.push(['r', 'refresh']);
   keys.push(['q', 'quit']);
   return (
@@ -220,6 +223,22 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
           </Text>
         </Text>
       ))}
+    </Box>
+  );
+}
+
+// The `:` prompt that replaces the footer while a command is being typed.
+function CommandBar({ text, app }: { text: string; app?: string }): ReactNode {
+  return (
+    <Box paddingX={1}>
+      <Text color={theme.accent} bold>
+        : dokku{' '}
+      </Text>
+      <Text>{text}</Text>
+      <Text color={theme.accent}>▌</Text>
+      <Text wrap="truncate-end" color={theme.dim}>
+        {'   '}enter run · esc cancel · ↑↓ history{app ? ` · $app → ${app}` : ''}
+      </Text>
     </Box>
   );
 }
@@ -457,6 +476,48 @@ function LogsView({
   );
 }
 
+function CommandView({
+  cmd,
+  running,
+  lines,
+  viewport,
+  offset,
+  width,
+}: {
+  cmd: string;
+  running: boolean;
+  lines: LogLine[];
+  viewport: number;
+  offset: number;
+  width: number;
+}): ReactNode {
+  const rows = Math.max(1, viewport - 1);
+  const end = Math.max(0, lines.length - offset);
+  const visible = lines.slice(Math.max(0, end - rows), end);
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          $ dokku {cmd}
+        </Text>
+        <Text color={running ? theme.warn : theme.dim}>
+          {'  '}{running ? '· running… (esc kills)' : '· finished (esc closes)'}
+        </Text>
+        {offset > 0 ? <Text color={theme.warn}>  · scrollback ↑{offset}</Text> : null}
+      </Text>
+      {visible.length === 0 ? (
+        <Text color={theme.dim}>{running ? 'Waiting for output…' : '(no output)'}</Text>
+      ) : (
+        visible.map((l, i) => (
+          <Text key={end - visible.length + i} color={l.err ? theme.warn : theme.text}>
+            {truncate(l.text, width)}
+          </Text>
+        ))
+      )}
+    </Box>
+  );
+}
+
 type CheatLine =
   | { type: 'spacer' }
   | { type: 'group'; text: string }
@@ -539,6 +600,16 @@ export default function App(): ReactNode {
   const [configLoading, setConfigLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
 
+  // `:` command line — the prompt text (null = closed), the running/finished
+  // command overlay, its streamed output, and a session-local history.
+  const [cmdInput, setCmdInput] = useState<string | null>(null);
+  const [histIdx, setHistIdx] = useState<number | null>(null);
+  const cmdHistory = useRef<string[]>([]);
+  const [cmdRun, setCmdRun] = useState<{ cmd: string; running: boolean } | null>(null);
+  const [cmdOutput, setCmdOutput] = useState<LogLine[]>([]);
+  const [cmdScroll, setCmdScroll] = useState(0);
+  const cmdStopRef = useRef<(() => void) | null>(null);
+
   const apps = data ? data.apps : [];
   const source: Source = data ? data.source : 'demo';
   const currentView = VIEWS[view];
@@ -592,6 +663,53 @@ export default function App(): ReactNode {
       stop();
     };
   }, [source, refresh]);
+
+  // Run a typed `:` command. Spawned directly (no shell); `$app` expands to
+  // the selected app. Output streams into the overlay with the same buffered
+  // flush as logs, and a refresh follows so the views reflect any changes.
+  const startCommand = (raw: string) => {
+    const text = raw.trim().replace(/^dokku\s+/, '');
+    setCmdInput(null);
+    setHistIdx(null);
+    if (!text) return;
+    if (cmdHistory.current[cmdHistory.current.length - 1] !== text) cmdHistory.current.push(text);
+    const args = text.split(/\s+/).map((t) => (t === '$app' ? currentApp?.name ?? t : t));
+    const shown = args.join(' ');
+    cmdStopRef.current?.();
+    setCmdOutput([]);
+    setCmdScroll(0);
+    if (source === 'demo') {
+      setCmdRun({ cmd: shown, running: false });
+      setCmdOutput([{ text: 'demo mode — no dokku binary to run against', err: true }]);
+      return;
+    }
+    setCmdRun({ cmd: shown, running: true });
+    const buf: LogLine[] = [];
+    const push = (t: string, err: boolean) => buf.push({ text: t, err });
+    const flushNow = () => {
+      if (buf.length === 0) return;
+      const chunk = buf.splice(0, buf.length);
+      setCmdOutput((prev) => {
+        const next = prev.concat(chunk);
+        return next.length > CMD_CAP ? next.slice(next.length - CMD_CAP) : next;
+      });
+    };
+    const flush = setInterval(flushNow, 150);
+    const stop = runCommand(args, push, (msg, ok) => {
+      push(msg, !ok);
+      clearInterval(flush);
+      flushNow();
+      setCmdRun((r) => (r ? { ...r, running: false } : r));
+      void refresh(); // the command may have changed state — show it
+    });
+    cmdStopRef.current = () => {
+      clearInterval(flush);
+      stop();
+    };
+  };
+
+  // Kill a still-running command if the whole app unmounts.
+  useEffect(() => () => cmdStopRef.current?.(), []);
 
   // 1s tick so the "↻ 12s" freshness readout in the header stays honest.
   const [now, setNow] = useState(() => Date.now());
@@ -687,8 +805,71 @@ export default function App(): ReactNode {
   }, [viewport]);
 
   useInput((input, key) => {
-    if (input === 'q' || (key.ctrl && input === 'c')) {
+    if (key.ctrl && input === 'c') {
       exit();
+      return;
+    }
+
+    // The `:` prompt owns the keyboard while open.
+    if (cmdInput !== null) {
+      if (key.escape) {
+        setCmdInput(null);
+        setHistIdx(null);
+        return;
+      }
+      if (key.return) {
+        startCommand(cmdInput);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setCmdInput((s) => (s ?? '').slice(0, -1));
+        return;
+      }
+      if (key.upArrow || key.downArrow) {
+        const h = cmdHistory.current;
+        if (h.length === 0) return;
+        const next = key.upArrow ? (histIdx ?? h.length) - 1 : (histIdx ?? h.length - 1) + 1;
+        if (next < 0) return;
+        if (next >= h.length) {
+          setHistIdx(null);
+          setCmdInput('');
+          return;
+        }
+        setHistIdx(next);
+        setCmdInput(h[next]);
+        return;
+      }
+      if (input && !key.ctrl && !key.meta && !key.tab) setCmdInput((s) => (s ?? '') + input);
+      return;
+    }
+
+    // Command output overlay: scroll, close (esc/q), or type another command.
+    if (cmdRun) {
+      if (key.escape || input === 'q') {
+        cmdStopRef.current?.();
+        cmdStopRef.current = null;
+        setCmdRun(null);
+        return;
+      }
+      if (input === ':') {
+        setCmdInput('');
+        return;
+      }
+      const up = key.upArrow || input === 'k';
+      const down = key.downArrow || input === 'j';
+      if (up || down) {
+        const max = Math.max(0, cmdOutput.length - (viewport - 1));
+        setCmdScroll((s) => Math.min(Math.max(0, s + (up ? 1 : -1)), max));
+      }
+      return;
+    }
+
+    if (input === 'q') {
+      exit();
+      return;
+    }
+    if (input === ':') {
+      setCmdInput('');
       return;
     }
     if (input >= '1' && input <= String(VIEWS.length)) {
@@ -789,6 +970,19 @@ export default function App(): ReactNode {
       content = <CheatsheetView width={colBudget} viewport={viewport} scroll={scroll} />;
       break;
   }
+  // A `:` command's output takes over the content pane until dismissed.
+  if (cmdRun) {
+    content = (
+      <CommandView
+        cmd={cmdRun.cmd}
+        running={cmdRun.running}
+        lines={cmdOutput}
+        viewport={viewport}
+        offset={cmdScroll}
+        width={colBudget}
+      />
+    );
+  }
 
   return (
     <Box flexDirection="column" height={rows}>
@@ -813,11 +1007,15 @@ export default function App(): ReactNode {
           borderColor={focus === 'content' && !currentView.perApp ? theme.accent : theme.dim}
           paddingX={1}
         >
-          <Text color={theme.dim}>{currentView.label.toUpperCase()}</Text>
+          <Text color={theme.dim}>{cmdRun ? 'COMMAND' : currentView.label.toUpperCase()}</Text>
           {content}
         </Box>
       </Box>
-      <Footer view={view} focused={focus} />
+      {cmdInput !== null ? (
+        <CommandBar text={cmdInput} app={currentApp?.name} />
+      ) : (
+        <Footer view={view} focused={focus} />
+      )}
     </Box>
   );
 }

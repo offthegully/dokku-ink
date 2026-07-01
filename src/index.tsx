@@ -56,6 +56,8 @@ KEYS (inside the dashboard)
   ← / → (h/l)    Switch app (in per-app views)
   tab            Toggle focus between the menu and the list/content
   s              Reveal / hide values (Config view)
+  :              Open the command line (run any dokku command;
+                 $app expands to the selected app, esc cancels/kills)
   r              Refresh data from Dokku
   q / Ctrl-C     Quit
 

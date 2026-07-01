@@ -2,7 +2,7 @@
 
 A terminal dashboard and command cheat sheet for [Dokku](https://dokku.com/), built with [Ink](https://github.com/vadimdemedes/ink) and TypeScript. It runs **directly on your Dokku host** and gives you a Claude-Code-style TUI to see your apps, domains, SSL, processes and config at a glance — no web front-end to host, no service to expose.
 
-This first version is **read-only**: it visualizes state and ships a built-in cheat sheet. It does not change anything on the server.
+The dashboard views are **read-only** — they only observe. Anything that changes state goes through the explicit `:` command line (see below), so nothing mutates your server unless you typed it.
 
 ```
  dokku-dash · my-server                                       5 apps   LIVE
@@ -89,6 +89,7 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 | `←` / `→` (`h`/`l`) | Switch app (in per-app views)            |
 | `tab`          | Toggle focus between the menu and the list    |
 | `s`            | Reveal / hide values (Config view)            |
+| `:`            | Open the command line (run any dokku command) |
 | `r`            | Refresh data from Dokku                       |
 | `q` / `Ctrl-C` | Quit                                          |
 
@@ -100,6 +101,15 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
 - **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
 - **Cheat Sheet** — a scrollable reference of the most useful `dokku` commands, grouped by area.
+
+### Running commands
+
+Press `:` and type any dokku command (with or without the leading `dokku`) — e.g. `ps:restart $app`, `ps:scale api web=2`, `letsencrypt:auto-renew`. `$app` expands to the currently selected app. Output streams live into the content pane; `↑`/`↓` scrolls it, `esc` kills a running command or closes the result, and the dashboard refreshes automatically afterward so the views reflect what you just did. `↑`/`↓` at the prompt cycles this session's command history.
+
+Safety properties worth knowing:
+
+- The command is spawned directly (`dokku <args>`) — there is **no shell**, so quoting tricks, pipes and `;` do nothing.
+- stdin is closed, so commands that normally prompt for confirmation (like `apps:destroy` without `--force`) abort instead of hanging — destroying something requires typing the same explicit flags the CLI would.
 
 ## Troubleshooting
 

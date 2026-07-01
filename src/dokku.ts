@@ -7,9 +7,9 @@
 // fallbacks. When `dokku` is not on PATH (e.g. local dev), we transparently
 // fall back to rich demo data so every view is still explorable.
 
-import { execFile, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
-import { DEMO } from './demo.js';
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import { DEMO } from "./demo.js";
 import type {
   ConfigResult,
   DokkuApp,
@@ -19,11 +19,11 @@ import type {
   RawReport,
   Source,
   Ssl,
-} from './types.js';
+} from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
-const DOKKU_BIN = process.env.DOKKU_DASH_BIN || 'dokku';
+const DOKKU_BIN = process.env.DOKKU_DASH_BIN || "dokku";
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -32,10 +32,10 @@ const DOKKU_BIN = process.env.DOKKU_DASH_BIN || 'dokku';
 let _hasDokku: boolean | null = null;
 
 export async function hasDokku(): Promise<boolean> {
-  if (process.env.DOKKU_DASH_DEMO === '1') return false;
+  if (process.env.DOKKU_DASH_DEMO === "1") return false;
   if (_hasDokku !== null) return _hasDokku;
   try {
-    await execFileAsync(DOKKU_BIN, ['version'], { timeout: 8000 });
+    await execFileAsync(DOKKU_BIN, ["version"], { timeout: 8000 });
     _hasDokku = true;
   } catch {
     _hasDokku = false;
@@ -68,7 +68,12 @@ async function dokkuRaw(args: string[]): Promise<RawResult> {
     return { ok: true, stdout, stderr };
   } catch (e) {
     const err = e as { stdout?: string; stderr?: string; message?: string };
-    return { ok: false, stdout: err.stdout ?? '', stderr: err.stderr ?? '', error: err.message ?? String(e) };
+    return {
+      ok: false,
+      stdout: err.stdout ?? "",
+      stderr: err.stderr ?? "",
+      error: err.message ?? String(e),
+    };
   }
 }
 
@@ -76,9 +81,15 @@ async function dokkuRaw(args: string[]): Promise<RawResult> {
 // header and of names being newline- or whitespace-separated.
 function parseAppNames(out: string): string[] {
   const names: string[] = [];
-  for (const line of out.split('\n')) {
+  for (const line of out.split("\n")) {
     const t = line.trim();
-    if (!t || t.startsWith('=====>') || t.startsWith('----') || t.startsWith('!')) continue;
+    if (
+      !t ||
+      t.startsWith("=====>") ||
+      t.startsWith("----") ||
+      t.startsWith("!")
+    )
+      continue;
     const tok = t.split(/\s+/)[0];
     if (tok) names.push(tok);
   }
@@ -89,12 +100,17 @@ function parseAppNames(out: string): string[] {
 // emits one JSON object *per app per line* (NDJSON) with no app key, which is
 // ambiguous to map back; calling per app returns one clean object we can attach
 // to that exact app. Returns undefined when the command errors or isn't JSON.
-async function reportForApp(plugin: string, app: string): Promise<Record<string, string> | undefined> {
-  const r = await dokkuRaw([`${plugin}:report`, app, '--format', 'json']);
+async function reportForApp(
+  plugin: string,
+  app: string,
+): Promise<Record<string, string> | undefined> {
+  const r = await dokkuRaw([`${plugin}:report`, app, "--format", "json"]);
   if (!r.ok) return undefined;
   try {
     const obj = JSON.parse(r.stdout.trim());
-    return obj && typeof obj === 'object' && !Array.isArray(obj) ? (obj as Record<string, string>) : undefined;
+    return obj && typeof obj === "object" && !Array.isArray(obj)
+      ? (obj as Record<string, string>)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -102,25 +118,35 @@ async function reportForApp(plugin: string, app: string): Promise<Record<string,
 
 // Run an async fn over items with bounded concurrency (keeps process fan-out
 // reasonable on hosts with many apps: N apps × 4 reports).
-async function mapLimit<T>(items: T[], limit: number, fn: (item: T, i: number) => Promise<void>): Promise<void> {
+async function mapLimit<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, i: number) => Promise<void>,
+): Promise<void> {
   let idx = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (;;) {
-      const i = idx++;
-      if (i >= items.length) break;
-      await fn(items[i], i);
-    }
-  });
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      for (;;) {
+        const i = idx++;
+        if (i >= items.length) break;
+        await fn(items[i], i);
+      }
+    },
+  );
   await Promise.all(workers);
 }
 
 export function toBool(v: unknown): boolean {
-  return v === true || v === 'true' || v === '1';
+  return v === true || v === "true" || v === "1";
 }
 
-function pick(obj: Record<string, string> | undefined, ...keys: string[]): string | undefined {
+function pick(
+  obj: Record<string, string> | undefined,
+  ...keys: string[]
+): string | undefined {
   for (const k of keys) {
-    if (obj && obj[k] !== undefined && obj[k] !== '') return obj[k];
+    if (obj && obj[k] !== undefined && obj[k] !== "") return obj[k];
   }
   return undefined;
 }
@@ -133,7 +159,9 @@ function pick(obj: Record<string, string> | undefined, ...keys: string[]): strin
 // Dokku derives these keys from its CONTAINER.<type>.<n> files, so they look
 // like "status-web.1": "running (abc123)". Accept a dash separator too for
 // older/alternative shapes.
-function parseProcesses(psEntry: Record<string, string> | undefined): Process[] {
+function parseProcesses(
+  psEntry: Record<string, string> | undefined,
+): Process[] {
   if (!psEntry) return [];
   const byType = new Map<string, ProcInstance[]>();
   for (const [key, value] of Object.entries(psEntry)) {
@@ -161,14 +189,16 @@ function splitHosts(str: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function normalizeCerts(certEntry: Record<string, string> | undefined): Ssl | null {
+function normalizeCerts(
+  certEntry: Record<string, string> | undefined,
+): Ssl | null {
   if (!certEntry) return null;
-  const enabled = toBool(pick(certEntry, 'ssl-enabled', 'enabled'));
-  const hostnames = pick(certEntry, 'ssl-hostnames', 'hostnames');
-  const issuer = pick(certEntry, 'ssl-issuer', 'issuer');
-  const expiresAt = pick(certEntry, 'ssl-expires-at', 'expires-at');
-  const startsAt = pick(certEntry, 'ssl-starts-at', 'starts-at');
-  const verified = pick(certEntry, 'ssl-verified', 'verified');
+  const enabled = toBool(pick(certEntry, "ssl-enabled", "enabled"));
+  const hostnames = pick(certEntry, "ssl-hostnames", "hostnames");
+  const issuer = pick(certEntry, "ssl-issuer", "issuer");
+  const expiresAt = pick(certEntry, "ssl-expires-at", "expires-at");
+  const startsAt = pick(certEntry, "ssl-starts-at", "starts-at");
+  const verified = pick(certEntry, "ssl-verified", "verified");
   if (!enabled && !hostnames && !issuer && !expiresAt) return null;
   return {
     enabled,
@@ -186,14 +216,14 @@ function normalizeCerts(certEntry: Record<string, string> | undefined): Ssl | nu
 
 export async function loadOverview(): Promise<Overview> {
   if (!(await hasDokku())) {
-    return { apps: structuredClone(DEMO.apps), source: 'demo', warnings: [] };
+    return { apps: structuredClone(DEMO.apps), source: "demo", warnings: [] };
   }
 
   const warnings: string[] = [];
   let names: string[] = [];
 
   // App names from `dokku apps:list` (header-tolerant parsing; no --quiet needed).
-  const listed = await dokkuRaw(['apps:list']);
+  const listed = await dokkuRaw(["apps:list"]);
   if (listed.ok) {
     names = parseAppNames(listed.stdout);
   } else {
@@ -210,10 +240,10 @@ export async function loadOverview(): Promise<Overview> {
   // dokku invocations — plenty, without hammering the host.
   await mapLimit(names, 4, async (name) => {
     const [a, ps, dom, cert] = await Promise.all([
-      reportForApp('apps', name),
-      reportForApp('ps', name),
-      reportForApp('domains', name),
-      reportForApp('certs', name),
+      reportForApp("apps", name),
+      reportForApp("ps", name),
+      reportForApp("domains", name),
+      reportForApp("certs", name),
     ]);
     if (a) appsRep[name] = a;
     if (ps) psRep[name] = ps;
@@ -222,7 +252,7 @@ export async function loadOverview(): Promise<Overview> {
   });
 
   const apps = buildApps(names, appsRep, psRep, domRep, certRep);
-  return { apps, source: 'dokku', warnings };
+  return { apps, source: "dokku", warnings };
 }
 
 // Pure normalisation from raw dokku JSON reports into the app model.
@@ -240,17 +270,18 @@ export function buildApps(
     const dom = (domRep && domRep[name]) || {};
     const cert = (certRep && certRep[name]) || {};
 
-    const runningRaw = pick(ps, 'running');
-    const appEnabled = pick(dom, 'app-enabled');
+    const runningRaw = pick(ps, "running");
+    const appEnabled = pick(dom, "app-enabled");
     return {
       name,
       running: runningRaw === undefined ? null : toBool(runningRaw),
-      deployed: toBool(pick(ps, 'deployed')),
-      deploySource: pick(a, 'deploy-source', 'deploy-source-metadata') || null,
-      createdAt: pick(a, 'created-at') || null,
-      restartPolicy: pick(ps, 'restart-policy', 'computed-restart-policy') || null,
+      deployed: toBool(pick(ps, "deployed")),
+      deploySource: pick(a, "deploy-source", "deploy-source-metadata") || null,
+      createdAt: pick(a, "created-at") || null,
+      restartPolicy:
+        pick(ps, "restart-policy", "computed-restart-policy") || null,
       processes: parseProcesses(ps),
-      domains: splitHosts(pick(dom, 'app-vhosts')),
+      domains: splitHosts(pick(dom, "app-vhosts")),
       domainsEnabled: appEnabled === undefined ? null : toBool(appEnabled),
       ssl: normalizeCerts(cert),
     };
@@ -258,17 +289,23 @@ export function buildApps(
 }
 
 // Per-app environment variables.
-export async function loadConfig(appName: string, source: Source): Promise<ConfigResult> {
-  if (source === 'demo' || !(await hasDokku())) {
-    return { vars: structuredClone(DEMO.config[appName] || {}), source: 'demo' };
+export async function loadConfig(
+  appName: string,
+  source: Source,
+): Promise<ConfigResult> {
+  if (source === "demo" || !(await hasDokku())) {
+    return {
+      vars: structuredClone(DEMO.config[appName] || {}),
+      source: "demo",
+    };
   }
 
   // Try JSON first (newer dokku), then fall back to parsing config:show text.
   try {
-    const out = await dokku(['config:show', appName, '--format', 'json']);
+    const out = await dokku(["config:show", appName, "--format", "json"]);
     const parsed = JSON.parse(out);
-    if (parsed && typeof parsed === 'object') {
-      return { vars: parsed as Record<string, string>, source: 'dokku' };
+    if (parsed && typeof parsed === "object") {
+      return { vars: parsed as Record<string, string>, source: "dokku" };
     }
   } catch {
     /* fall through */
@@ -276,20 +313,20 @@ export async function loadConfig(appName: string, source: Source): Promise<Confi
 
   const vars: Record<string, string> = {};
   try {
-    const out = await dokku(['config:show', appName]);
-    for (const line of out.split('\n')) {
+    const out = await dokku(["config:show", appName]);
+    for (const line of out.split("\n")) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('=====>')) continue;
-      const idx = trimmed.indexOf(':');
+      if (!trimmed || trimmed.startsWith("=====>")) continue;
+      const idx = trimmed.indexOf(":");
       if (idx === -1) continue;
       const key = trimmed.slice(0, idx).trim();
       const value = trimmed.slice(idx + 1).trim();
       if (key) vars[key] = value;
     }
   } catch (e) {
-    return { vars: {}, source: 'dokku', error: (e as Error).message };
+    return { vars: {}, source: "dokku", error: (e as Error).message };
   }
-  return { vars, source: 'dokku' };
+  return { vars, source: "dokku" };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,12 +335,44 @@ export async function loadConfig(appName: string, source: Source): Promise<Confi
 
 export type LogSink = (line: string, isErr: boolean) => void;
 
+// App output can carry ANSI colour codes, tabs and \r — all of which throw
+// off Ink's width math and cause the layout to jitter. Strip to plain text.
+const sanitizeLine = (s: string) =>
+  s
+    .replace(/\r$/, "")
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+    .replace(/\t/g, "  ");
+
+// Feed a child stream to onLine one sanitized line at a time.
+function streamLines(
+  stream: NodeJS.ReadableStream,
+  isErr: boolean,
+  onLine: LogSink,
+): void {
+  let buf = "";
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk: string) => {
+    buf += chunk;
+    let i: number;
+    while ((i = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      if (line.trim()) onLine(sanitizeLine(line), isErr);
+    }
+  });
+}
+
 // Stream `dokku logs <app> -t` line by line. Returns a stop function that
 // kills the child (or the demo generator). `onEnd` fires if the stream dies
 // on its own — e.g. the app has no deployed containers to tail.
-export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (msg: string) => void): () => void {
-  if (source === 'demo') {
-    const paths = ['/', '/health', '/api/items', '/login', '/static/app.css'];
+export function tailLogs(
+  app: string,
+  source: Source,
+  onLine: LogSink,
+  onEnd: (msg: string) => void,
+): () => void {
+  if (source === "demo") {
+    const paths = ["/", "/health", "/api/items", "/login", "/static/app.css"];
     let n = 0;
     const t = setInterval(() => {
       n++;
@@ -317,39 +386,57 @@ export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (m
     return () => clearInterval(t);
   }
 
-  const child = spawn(DOKKU_BIN, ['logs', app, '-t', '-n', '100'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+  const child = spawn(DOKKU_BIN, ["logs", app, "-t", "-n", "100"], {
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  // App output can carry ANSI colour codes, tabs and \r — all of which throw
-  // off Ink's width math and cause the layout to jitter. Strip to plain text.
-  const sanitize = (s: string) =>
-    s.replace(/\r$/, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\t/g, '  ');
-  const readLines = (stream: NodeJS.ReadableStream, isErr: boolean) => {
-    let buf = '';
-    stream.setEncoding('utf8');
-    stream.on('data', (chunk: string) => {
-      buf += chunk;
-      let i: number;
-      while ((i = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, i);
-        buf = buf.slice(i + 1);
-        if (line.trim()) onLine(sanitize(line), isErr);
-      }
-    });
-  };
-  readLines(child.stdout, false);
-  readLines(child.stderr, true);
+  streamLines(child.stdout, false, onLine);
+  streamLines(child.stderr, true, onLine);
 
   let stopped = false;
-  child.on('error', (e) => {
+  child.on("error", (e) => {
     if (!stopped) onEnd(`log stream failed: ${e.message}`);
   });
-  child.on('exit', (code, signal) => {
+  child.on("exit", (code, signal) => {
     if (!stopped) onEnd(`log stream ended (${signal ?? `exit ${code}`})`);
   });
   return () => {
     stopped = true;
-    child.kill('SIGTERM');
+    child.kill("SIGTERM");
+  };
+}
+
+// Run an arbitrary `dokku <args>` command, streaming its combined output.
+// Spawned directly (no shell), so the typed text can't be shell-injected.
+// stdin is closed: commands that would prompt for confirmation (e.g.
+// apps:destroy without --force) read EOF and abort instead of hanging.
+// Returns a stop function that kills the child.
+export function runCommand(
+  args: string[],
+  onLine: LogSink,
+  onEnd: (msg: string, ok: boolean) => void,
+): () => void {
+  const child = spawn(DOKKU_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+  streamLines(child.stdout, false, onLine);
+  streamLines(child.stderr, true, onLine);
+
+  let stopped = false;
+  child.on("error", (e) => {
+    if (stopped) return;
+    stopped = true;
+    onEnd(`✖ failed to run: ${e.message}`, false);
+  });
+  // 'close' (not 'exit') so the final stdout/stderr chunks land first.
+  child.on("close", (code, signal) => {
+    if (stopped) return;
+    stopped = true;
+    onEnd(
+      code === 0 ? "✔ done (exit 0)" : `✖ ${signal ?? `exit ${code}`}`,
+      code === 0,
+    );
+  });
+  return () => {
+    stopped = true;
+    child.kill("SIGTERM");
   };
 }
 
@@ -357,15 +444,20 @@ export function tailLogs(app: string, source: Source, onLine: LogSink, onEnd: (m
 // and report each event line as it lands. When events logging is disabled or
 // the plugin is missing the child exits straight away — `onUnavailable` fires
 // once and the caller just stays on polling.
-export function watchEvents(onEvent: (line: string) => void, onUnavailable?: () => void): () => void {
-  const child = spawn(DOKKU_BIN, ['events', '-t'], { stdio: ['ignore', 'pipe', 'ignore'] });
+export function watchEvents(
+  onEvent: (line: string) => void,
+  onUnavailable?: () => void,
+): () => void {
+  const child = spawn(DOKKU_BIN, ["events", "-t"], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   let stopped = false;
-  let buf = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk: string) => {
+  let buf = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
     buf += chunk;
     let i: number;
-    while ((i = buf.indexOf('\n')) !== -1) {
+    while ((i = buf.indexOf("\n")) !== -1) {
       const line = buf.slice(0, i).trim();
       buf = buf.slice(i + 1);
       if (line && !stopped) onEvent(line);
@@ -376,11 +468,11 @@ export function watchEvents(onEvent: (line: string) => void, onUnavailable?: () 
     stopped = true;
     onUnavailable?.();
   };
-  child.on('error', dead);
-  child.on('exit', dead);
+  child.on("error", dead);
+  child.on("exit", dead);
   return () => {
     stopped = true;
-    child.kill('SIGTERM');
+    child.kill("SIGTERM");
   };
 }
 
@@ -388,68 +480,87 @@ export function watchEvents(onEvent: (line: string) => void, onUnavailable?: () 
 // Diagnostics: `dokku-dash --doctor`
 // ---------------------------------------------------------------------------
 
-const indent = (s: string) => s.split('\n').map((l) => '  ' + l).join('\n');
-const clip = (s: string, n = 500) => (s.length > n ? s.slice(0, n) + '\n  …(truncated)' : s);
+const indent = (s: string) =>
+  s
+    .split("\n")
+    .map((l) => "  " + l)
+    .join("\n");
+const clip = (s: string, n = 500) =>
+  s.length > n ? s.slice(0, n) + "\n  …(truncated)" : s;
 
 export async function runDoctor(): Promise<string> {
   const L: string[] = [];
-  L.push('dokku-dash doctor');
+  L.push("dokku-dash doctor");
   L.push(`binary: ${DOKKU_BIN}   (override with DOKKU_DASH_BIN)`);
-  L.push('');
+  L.push("");
 
-  const v = await dokkuRaw(['version']);
-  L.push(`# dokku version  ->  ${v.ok ? 'OK' : 'FAILED'}`);
-  L.push(indent(clip((v.stdout || v.stderr || v.error || '').trim(), 200)));
-  L.push('');
+  const v = await dokkuRaw(["version"]);
+  L.push(`# dokku version  ->  ${v.ok ? "OK" : "FAILED"}`);
+  L.push(indent(clip((v.stdout || v.stderr || v.error || "").trim(), 200)));
+  L.push("");
 
-  const al = await dokkuRaw(['apps:list']);
-  L.push(`# dokku apps:list  ->  ${al.ok ? 'OK' : 'FAILED'}`);
+  const al = await dokkuRaw(["apps:list"]);
+  L.push(`# dokku apps:list  ->  ${al.ok ? "OK" : "FAILED"}`);
   L.push(indent(clip((al.ok ? al.stdout : al.error || al.stderr).trim(), 400)));
   const names = al.ok ? parseAppNames(al.stdout) : [];
-  L.push(`  parsed ${names.length} name(s): ${names.join(', ') || '(none)'}`);
-  L.push('');
+  L.push(`  parsed ${names.length} name(s): ${names.join(", ") || "(none)"}`);
+  L.push("");
 
   // Normalize first so the probes can target an app that actually has
   // containers — probing a never-deployed app shows no status keys and would
   // hide process-parsing bugs.
   const ov = await loadOverview();
-  const probe = (ov.source === 'dokku' ? ov.apps.find((a) => a.running)?.name : undefined) ?? names[0];
+  const probe =
+    (ov.source === "dokku"
+      ? ov.apps.find((a) => a.running)?.name
+      : undefined) ?? names[0];
 
   // Probe the actual strategy: per-app `<plugin>:report <app> --format json`.
-  for (const plugin of ['apps', 'ps', 'domains', 'certs']) {
+  for (const plugin of ["apps", "ps", "domains", "certs"]) {
     if (!probe) break;
-    const r = await dokkuRaw([`${plugin}:report`, probe, '--format', 'json']);
+    const r = await dokkuRaw([`${plugin}:report`, probe, "--format", "json"]);
     let verdict: string;
-    let keys = '';
+    let keys = "";
     let obj: Record<string, string> | undefined;
     if (!r.ok) {
-      verdict = 'FAILED (command errored)';
+      verdict = "FAILED (command errored)";
     } else {
       try {
         obj = JSON.parse(r.stdout.trim());
-        verdict = 'OK (valid JSON)';
-        keys = Object.keys(obj!).slice(0, 20).join(', ');
+        verdict = "OK (valid JSON)";
+        keys = Object.keys(obj!).slice(0, 20).join(", ");
       } catch (e) {
-        verdict = 'NOT valid JSON: ' + (e as Error).message;
+        verdict = "NOT valid JSON: " + (e as Error).message;
       }
     }
     L.push(`# dokku ${plugin}:report ${probe} --format json  ->  ${verdict}`);
-    L.push(indent(clip((r.ok ? r.stdout : r.error || r.stderr).trim(), plugin === 'ps' ? 900 : 300)));
+    L.push(
+      indent(
+        clip(
+          (r.ok ? r.stdout : r.error || r.stderr).trim(),
+          plugin === "ps" ? 900 : 300,
+        ),
+      ),
+    );
     if (keys) L.push(`  keys: ${keys}`);
-    if (plugin === 'ps' && obj) {
+    if (plugin === "ps" && obj) {
       const procs = parseProcesses(obj);
-      L.push(`  parsed processes: ${procs.map((p) => `${p.type}×${p.scale}`).join(', ') || '(none)'}`);
+      L.push(
+        `  parsed processes: ${procs.map((p) => `${p.type}×${p.scale}`).join(", ") || "(none)"}`,
+      );
     }
-    L.push('');
+    L.push("");
   }
 
-  if (ov.source === 'dokku') {
-    const ev = await dokkuRaw(['events']);
+  if (ov.source === "dokku") {
+    const ev = await dokkuRaw(["events"]);
     L.push(
-      `# dokku events  ->  ${ev.ok ? 'OK — event-driven refresh active' : 'unavailable — run `dokku events:on` for push refresh (polling still works)'}`,
+      `# dokku events  ->  ${ev.ok ? "OK — event-driven refresh active" : "unavailable — run `dokku events:on` for push refresh (polling still works)"}`,
     );
-    L.push(indent(clip((ev.ok ? ev.stdout : ev.error || ev.stderr).trim(), 300)));
-    L.push('');
+    L.push(
+      indent(clip((ev.ok ? ev.stdout : ev.error || ev.stderr).trim(), 300)),
+    );
+    L.push("");
   }
 
   L.push(`# loadOverview()  ->  source=${ov.source}, apps=${ov.apps.length}`);
@@ -458,14 +569,14 @@ export async function runDoctor(): Promise<string> {
       ov.apps
         .map(
           (a) =>
-            `${a.name}  running=${a.running}  procs=${a.processes.map((p) => `${p.type}x${p.scale}`).join(',') || '-'}  domains=${a.domains.join(' ') || '-'}  ssl=${a.ssl ? 'yes' : 'no'}`,
+            `${a.name}  running=${a.running}  procs=${a.processes.map((p) => `${p.type}x${p.scale}`).join(",") || "-"}  domains=${a.domains.join(" ") || "-"}  ssl=${a.ssl ? "yes" : "no"}`,
         )
-        .join('\n') || '(no apps)',
+        .join("\n") || "(no apps)",
     ),
   );
   if (ov.warnings.length) {
-    L.push('warnings:');
-    L.push(indent(ov.warnings.join('\n')));
+    L.push("warnings:");
+    L.push(indent(ov.warnings.join("\n")));
   }
-  return L.join('\n');
+  return L.join("\n");
 }

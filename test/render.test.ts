@@ -33,6 +33,21 @@ test('renders the dashboard with demo data', async () => {
   unmount();
 });
 
+test('`:` opens the command bar and escape closes it', async () => {
+  const { lastFrame, stdin, unmount } = render(React.createElement(App));
+  await tick();
+  stdin.write(':');
+  await tick(20);
+  assert.match(lastFrame() ?? '', /: dokku/);
+  stdin.write('ps:restart');
+  await tick(20);
+  assert.match(lastFrame() ?? '', /ps:restart/);
+  stdin.write(''); // escape — cancel without running
+  await tick(20);
+  assert.doesNotMatch(lastFrame() ?? '', /: dokku/);
+  unmount();
+});
+
 test('config view masks values until revealed', async () => {
   const { lastFrame, stdin, unmount } = render(React.createElement(App));
   await tick();
