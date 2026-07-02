@@ -74,7 +74,22 @@ test('tab cycles to the next view', () =>
   withApp(async ({ lastFrame, stdin }) => {
     stdin.write('\t');
     await tick(20);
-    assert.match(lastFrame() ?? '', /DOMAINS & SSL/); // pane title of view 2
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /SSL CERTIFICATE/); // Domains detail in the bottom pane
+    assert.match(frame, /NAME.*STATUS.*PROCESSES/); // apps table stays on top
+  }));
+
+test('←/→ switches the detail tab and ↑↓ still selects the app', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('[C'); // → to Domains & SSL
+    await tick(20);
+    assert.match(lastFrame() ?? '', /SSL CERTIFICATE/);
+    stdin.write('[B'); // ↓ selects the next app in the table
+    await tick(20);
+    assert.match(lastFrame() ?? '', /api {2}● running/); // detail follows the selection
+    stdin.write('[D'); // ← back to Overview
+    await tick(300); // debounce + loadAppDetail()
+    assert.match(lastFrame() ?? '', /GIT/);
   }));
 
 test('`/` filters the app list live', () =>

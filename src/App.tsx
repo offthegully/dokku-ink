@@ -49,11 +49,16 @@ interface ViewDef {
   label: string;
   /** Compact label for the tab bar on narrow terminals. */
   short: string;
+  /**
+   * Per-app views share one layout: the apps table on top (↑↓ selects), a tab
+   * strip, and a detail pane for the selected app below. Global views
+   * (Services, Cheat Sheet) take the whole pane instead.
+   */
   perApp: boolean;
 }
 
 const VIEWS: ViewDef[] = [
-  { key: 'apps', label: 'Apps', short: 'Apps', perApp: false },
+  { key: 'apps', label: 'Overview', short: 'Info', perApp: true },
   { key: 'domains', label: 'Domains & SSL', short: 'Domains', perApp: true },
   { key: 'process', label: 'Processes', short: 'Procs', perApp: true },
   { key: 'config', label: 'Config / Env', short: 'Config', perApp: true },
@@ -192,13 +197,15 @@ function Header({
   );
 }
 
-// One-line view switcher under the header. Full labels when they fit, compact
-// ones otherwise — either way the digits stay visible as the hotkeys.
-function TabBar({ view, columns }: { view: number; columns: number }): ReactNode {
+// One-line view switcher that sits on the detail pane — in per-app views it
+// doubles as the separator between the apps table and the detail below. Full
+// labels when they fit, compact ones otherwise — either way the digits stay
+// visible as the hotkeys. An active `/` filter shows at the end of the strip.
+function TabBar({ view, columns, filter }: { view: number; columns: number; filter?: string }): ReactNode {
   const fullWidth = VIEWS.reduce((s, v, i) => s + String(i + 1).length + v.label.length + 5, 2);
   const useShort = fullWidth > columns;
   return (
-    <Box paddingX={1}>
+    <Box>
       {VIEWS.map((v, i) => {
         const sel = i === view;
         const label = ` ${i + 1} ${useShort ? v.short : v.label} `;
@@ -218,42 +225,7 @@ function TabBar({ view, columns }: { view: number; columns: number }): ReactNode
           </Text>
         );
       })}
-    </Box>
-  );
-}
-
-function AppSelector({
-  apps,
-  selected,
-  height,
-  filter,
-  width,
-}: {
-  apps: DokkuApp[];
-  selected: number;
-  height: number;
-  filter: string;
-  width: number;
-}): ReactNode {
-  const { start, items } = windowed(apps, selected, height);
-  const nameW = Math.max(8, width - 8); // borders + padding + status dot
-  return (
-    <Box flexDirection="column" width={width} flexShrink={0} borderStyle="round" borderColor={theme.dim} paddingX={1}>
-      <Text wrap="truncate-end" color={theme.dim}>APPS{filter ? <Text color={theme.warn}> /{filter}</Text> : null}</Text>
-      {items.map((a, i) => {
-        const idx = start + i;
-        const sel = idx === selected;
-        const dot = a.running === true ? theme.good : a.running === false ? theme.bad : theme.dim;
-        return (
-          <Box key={a.name}>
-            <Text color={dot}>{sel ? '●' : '·'} </Text>
-            <Text wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.text}>
-              {padEnd(a.name, nameW)}
-            </Text>
-          </Box>
-        );
-      })}
-      {apps.length === 0 ? <Text color={theme.dim}> no match</Text> : null}
+      {filter ? <Text color={theme.warn}> /{filter}</Text> : null}
     </Box>
   );
 }
@@ -265,12 +237,12 @@ function Footer({ view, columns }: { view: number; columns: number }): ReactNode
   // kept at all costs: it's how the remaining keys stay discoverable.
   const keys: Array<[string, string, number]> = [
     [`1-${VIEWS.length}`, 'view', 4],
-    ['tab', 'next view', 3],
-    ['↑↓', v.key === 'logs' ? 'scroll logs' : 'move', 9],
+    ['←→', 'switch view', 3],
+    ['↑↓', v.perApp ? 'app' : 'move', 9],
   ];
-  if (v.perApp) keys.push(['←→', 'app', 6]);
+  if (v.key === 'logs' || v.key === 'config') keys.push(['j/k', 'scroll', 6]);
   if (v.key === 'cheatsheet') keys.push(['↵', 'insert cmd', 8]);
-  if (v.key === 'apps' || v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter', 5]);
+  if (v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter', 5]);
   if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
   keys.push([':', 'command', 7]);
   keys.push(['r', 'refresh', 2]);
@@ -345,30 +317,22 @@ function FilterBar({ text, target }: { text: string; target: string }): ReactNod
 // Views
 // ---------------------------------------------------------------------------
 
-// Rows the summary pane under the apps table occupies (separator included).
-const SUMMARY_ROWS = 9;
-
-// Compact always-visible drill-in for the selected app, rendered under the
-// apps table — replaces the old Enter-to-open detail overlay.
+// The Overview tab's detail pane: a compact drill-in for the selected app.
 function AppSummary({
   app,
   detail,
   loading,
   services,
-  width,
 }: {
   app: DokkuApp;
   detail?: AppDetail;
   loading: boolean;
   services: DokkuService[] | null;
-  width: number;
 }): ReactNode {
   const linked = (services ?? []).filter((s) => s.links.includes(app.name));
   const lbl = (t: string) => <Text color={theme.dim}>{padEnd(t, 9)}</Text>;
   return (
     <Box flexDirection="column">
-      <Text> </Text>
-      <Text color={theme.dim}>{'─'.repeat(Math.max(10, width))}</Text>
       <Text wrap="truncate-end">
         <Text bold color={theme.accent}>
           {app.name}
@@ -427,24 +391,18 @@ function AppSummary({
   );
 }
 
-function AppsView({
+// The always-visible apps table on top of every per-app view. ↑↓ moves the
+// selection; the detail pane below tracks it.
+function AppTable({
   apps,
   stats,
   selected,
-  viewport,
-  width,
-  detail,
-  detailLoading,
-  services,
+  height,
 }: {
   apps: DokkuApp[];
   stats: StatsMap | null;
   selected: number;
-  viewport: number;
-  width: number;
-  detail?: AppDetail;
-  detailLoading: boolean;
-  services: DokkuService[] | null;
+  height: number;
 }): ReactNode {
   if (apps.length === 0) return <Text color={theme.dim}>No apps found.</Text>;
   // Fixed-width columns first, then the flexible DOMAIN column last so it can
@@ -457,12 +415,9 @@ function AppsView({
   const memW = 7;
   const ageW = 6;
   const sslW = 11;
-  // The summary pane only appears when the terminal is tall enough to keep a
-  // useful table above it.
-  const showSummary = viewport >= SUMMARY_ROWS + 5;
-  const tableRows = showSummary ? Math.max(4, viewport - SUMMARY_ROWS) : viewport;
-  const { start, items } = windowed(apps, selected, tableRows - 1);
-  const sel = apps[selected];
+  // One row for the header, one for the window hint when the list overflows.
+  const listRows = Math.max(1, height - 1 - (apps.length > height - 1 ? 1 : 0));
+  const { start, items } = windowed(apps, selected, listRows);
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end" color={theme.dim}>
@@ -503,9 +458,6 @@ function AppsView({
         );
       })}
       {windowHint(apps.length, start, items.length)}
-      {showSummary && sel ? (
-        <AppSummary app={sel} detail={detail} loading={detailLoading} services={services} width={width} />
-      ) : null}
     </Box>
   );
 }
@@ -877,9 +829,9 @@ function ServicesView({
 function HelpView(): ReactNode {
   const rows: Array<[string, string] | null> = [
     ['1-7', 'jump to a view'],
-    ['tab / shift-tab', 'next / previous view'],
-    ['↑↓ / jk', 'move selection · scroll logs/config'],
-    ['←→ / hl', 'switch app in per-app views'],
+    ['←→ / hl / tab', 'next / previous view'],
+    ['↑↓', 'select app · move in lists'],
+    ['j / k', 'scroll the detail pane (logs, config)'],
     ['enter', 'insert cheat-sheet command into the `:` prompt'],
     ['esc', 'close help · cancel prompt · kill running command'],
     ['/', 'filter the app list (or cheat sheet) · esc clears'],
@@ -1332,7 +1284,7 @@ export default function App(): ReactNode {
   // app the Apps summary pane or a per-app view is showing. Uncached fetches
   // are debounced a beat so holding ↓ through the list doesn't fire a report
   // sweep per row.
-  const wantDetail = currentView.key === 'apps' || currentView.perApp;
+  const wantDetail = currentView.perApp;
   useEffect(() => {
     if (!wantDetail || !currentApp) return;
     const entry = detailCache[currentApp.name];
@@ -1352,19 +1304,26 @@ export default function App(): ReactNode {
     };
   }, [wantDetail, currentApp, source, detailCache, dataV]);
 
-  // Layout sizing. Boxes get explicit widths that sum to `columns` so nothing
-  // overflows; `colBudget` is the usable text width inside the content pane
-  // (minus borders, padding and a safety margin so lines never soft-wrap).
-  // The app selector grows to fit the longest app name instead of truncating.
-  const longestApp = allApps.reduce((m, a) => Math.max(m, a.name.length), 0);
-  const selW = Math.min(34, Math.max(18, longestApp + 8));
-  const contentW = Math.max(30, columns - (currentView.perApp ? selW : 0));
-  const colBudget = Math.max(20, contentW - 7);
-  const viewport = Math.max(3, rows - 8); // header + tab bar + borders + title + footer
+  // Layout sizing. One full-width bordered pane between header and footer.
+  // `colBudget` is the usable text width inside it (minus borders, padding and
+  // a safety margin so lines never soft-wrap). Vertically, per-app views split
+  // the pane: apps table on top, tab strip + spacer, then a fixed-height
+  // detail pane (~60%) so the split doesn't move when switching tabs.
+  const colBudget = Math.max(20, columns - 7);
+  const inner = Math.max(8, rows - 4); // header + footer + pane borders
+  const stripRows = 2; // tab strip + the blank line under it
+  const MIN_TABLE = 5; // column header + a few app rows
+  let detailViewport = Math.max(6, Math.floor((inner - stripRows) * 0.6));
+  if (inner - stripRows - detailViewport < MIN_TABLE) {
+    detailViewport = Math.max(3, inner - stripRows - MIN_TABLE);
+  }
+  const tableRows = Math.max(0, inner - stripRows - detailViewport);
+  const fullViewport = Math.max(3, inner - stripRows); // global views (no table)
+  const overlayViewport = Math.max(3, inner - 1); // help/command take the pane, minus a title row
 
   const clampScroll = useCallback((delta: number, total: number) => {
-    setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - viewport)));
-  }, [viewport]);
+    setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - detailViewport)));
+  }, [detailViewport]);
 
   // Prefill a quick action into the `:` prompt (never auto-runs).
   const quickAction = (ch: string): boolean => {
@@ -1459,7 +1418,7 @@ export default function App(): ReactNode {
       const up = key.upArrow || input === 'k';
       const down = key.downArrow || input === 'j';
       if (up || down) {
-        const max = Math.max(0, cmdOutput.length - (viewport - 1));
+        const max = Math.max(0, cmdOutput.length - (overlayViewport - 1));
         setCmdScroll((s) => Math.min(Math.max(0, s + (up ? 1 : -1)), max));
       }
       return;
@@ -1477,7 +1436,7 @@ export default function App(): ReactNode {
       setHelpOpen(true);
       return;
     }
-    if (input === '/' && (currentView.key === 'apps' || currentView.perApp || currentView.key === 'cheatsheet')) {
+    if (input === '/' && (currentView.perApp || currentView.key === 'cheatsheet')) {
       setFilterInput(filterTarget === 'cheat' ? cheatFilter : appFilter);
       return;
     }
@@ -1501,7 +1460,7 @@ export default function App(): ReactNode {
       setSvcReveal((v) => !v);
       return;
     }
-    if ((currentView.key === 'apps' || currentView.perApp) && quickAction(input)) return;
+    if (currentView.perApp && quickAction(input)) return;
 
     if (key.return) {
       if (currentView.key === 'cheatsheet') {
@@ -1515,25 +1474,43 @@ export default function App(): ReactNode {
       return;
     }
 
-    // ←/→ (h/l) always switches the selected app in per-app views, even when
-    // ↑/↓ is busy scrolling long content (e.g. a big config list).
+    // ←/→ (h/l) steps through the detail tabs, wrapping like tab does.
     const left = key.leftArrow || input === 'h';
     const right = key.rightArrow || input === 'l';
-    if ((left || right) && currentView.perApp) {
-      setSelectedApp((i) => Math.min(Math.max(0, i + (right ? 1 : -1)), apps.length - 1));
-      setScroll(0);
+    if (left || right) {
+      setView((v) => (v + (right ? 1 : -1) + VIEWS.length) % VIEWS.length);
       return;
     }
 
-    const up = key.upArrow || input === 'k';
-    const down = key.downArrow || input === 'j';
-    if (!up && !down) return;
-    const delta = up ? -1 : 1;
+    const up = key.upArrow;
+    const down = key.downArrow;
+    const scrollUp = input === 'k';
+    const scrollDown = input === 'j';
 
-    if (currentView.key === 'apps') {
-      setSelectedApp((i) => Math.min(Math.max(0, i + delta), apps.length - 1));
+    if (currentView.perApp) {
+      // Arrows always move the app selection; j/k scrolls the detail pane
+      // content (log scrollback, long config lists) without a mode switch.
+      if (up || down) {
+        setSelectedApp((i) => Math.min(Math.max(0, i + (down ? 1 : -1)), apps.length - 1));
+        setScroll(0);
+        return;
+      }
+      if (scrollUp || scrollDown) {
+        if (currentView.key === 'logs') {
+          // k digs into scrollback, j moves back toward the live tail.
+          const max = Math.max(0, logLines.length - (detailViewport - 1));
+          setScroll((s) => Math.min(Math.max(0, s + (scrollUp ? 1 : -1)), max));
+        } else if (currentView.key === 'config') {
+          const total = currentApp ? Object.keys(configCache[currentApp.name]?.vars || {}).length : 0;
+          clampScroll(scrollDown ? 1 : -1, total);
+        }
+      }
       return;
     }
+
+    // Global list views: arrows and j/k both move the cursor.
+    if (!up && !down && !scrollUp && !scrollDown) return;
+    const delta = up || scrollUp ? -1 : 1;
     if (currentView.key === 'services') {
       const total = services?.list.length ?? 0;
       setSvcCursor((i) => Math.min(Math.max(0, i + delta), Math.max(0, total - 1)));
@@ -1546,24 +1523,6 @@ export default function App(): ReactNode {
         while (i >= 0 && i < lines.length && lines[i].type !== 'item') i += delta;
         return i >= 0 && i < lines.length ? i : c;
       });
-      return;
-    }
-    if (currentView.perApp) {
-      if (currentView.key === 'logs') {
-        // ↑ digs into scrollback, ↓ moves back toward the live tail.
-        const max = Math.max(0, logLines.length - (viewport - 1));
-        setScroll((s) => Math.min(Math.max(0, s + (up ? 1 : -1)), max));
-        return;
-      }
-      if (currentView.key === 'config') {
-        const total = currentApp ? Object.keys(configCache[currentApp.name]?.vars || {}).length : 0;
-        if (total > viewport) {
-          clampScroll(delta, total);
-          return;
-        }
-      }
-      setSelectedApp((i) => Math.min(Math.max(0, i + delta), apps.length - 1));
-      setScroll(0);
     }
   });
 
@@ -1580,17 +1539,15 @@ export default function App(): ReactNode {
   let content: ReactNode = null;
   switch (currentView.key) {
     case 'apps':
-      content = (
-        <AppsView
-          apps={apps}
-          stats={statsMap}
-          selected={selectedApp}
-          viewport={viewport}
-          width={colBudget}
+      content = currentApp ? (
+        <AppSummary
+          app={currentApp}
           detail={currentDetail}
-          detailLoading={detailLoading}
+          loading={detailLoading}
           services={services ? services.list : null}
         />
+      ) : (
+        <Text color={theme.dim}>No app selected.</Text>
       );
       break;
     case 'domains':
@@ -1606,13 +1563,13 @@ export default function App(): ReactNode {
           config={currentApp ? configCache[currentApp.name]?.vars : {}}
           loading={configLoading && !(currentApp && configCache[currentApp.name])}
           reveal={reveal}
-          viewport={viewport}
+          viewport={detailViewport}
           scroll={scroll}
         />
       );
       break;
     case 'logs':
-      content = <LogsView app={currentApp} lines={logLines} viewport={viewport} offset={scroll} width={colBudget} />;
+      content = <LogsView app={currentApp} lines={logLines} viewport={detailViewport} offset={scroll} width={colBudget} />;
       break;
     case 'services':
       content = (
@@ -1621,7 +1578,7 @@ export default function App(): ReactNode {
           loading={servicesLoading}
           cursor={svcCursor}
           reveal={svcReveal}
-          viewport={viewport}
+          viewport={fullViewport}
         />
       );
       break;
@@ -1629,27 +1586,27 @@ export default function App(): ReactNode {
       content = (
         <CheatsheetView
           width={colBudget}
-          viewport={viewport}
+          viewport={fullViewport}
           cursor={cheatCursor}
           filter={cheatFilterLive}
         />
       );
       break;
   }
-  // Overlays take over the content pane until dismissed.
-  let paneTitle = currentView.label.toUpperCase();
+  // Overlays take over the whole pane until dismissed.
+  let overlayTitle: string | null = null;
   if (helpOpen) {
-    paneTitle = 'HELP';
+    overlayTitle = 'HELP';
     content = <HelpView />;
   }
   if (cmdRun) {
-    paneTitle = 'COMMAND';
+    overlayTitle = 'COMMAND';
     content = (
       <CommandView
         cmd={cmdRun.cmd}
         running={cmdRun.running}
         lines={cmdOutput}
-        viewport={viewport}
+        viewport={overlayViewport}
         offset={cmdScroll}
         width={colBudget}
       />
@@ -1668,25 +1625,30 @@ export default function App(): ReactNode {
         refreshing={refreshing && !loading}
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
-      <TabBar view={view} columns={columns} />
-      <Box flexGrow={1}>
-        {currentView.perApp ? (
-          <AppSelector apps={apps} selected={selectedApp} height={viewport} filter={appFilterLive} width={selW} />
-        ) : null}
-        <Box
-          width={contentW}
-          flexShrink={0}
-          flexDirection="column"
-          borderStyle="round"
-          borderColor={theme.dim}
-          paddingX={2}
-        >
-          <Text wrap="truncate-end" color={theme.dim}>
-            {paneTitle}
-            {!cmdRun && !helpOpen && activeFilter ? <Text color={theme.warn}>  /{activeFilter}</Text> : null}
-          </Text>
-          {content}
-        </Box>
+      <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
+        {overlayTitle ? (
+          <>
+            <Text wrap="truncate-end" color={theme.dim}>{overlayTitle}</Text>
+            {content}
+          </>
+        ) : currentView.perApp ? (
+          <>
+            <Box height={tableRows} flexShrink={0} flexDirection="column" overflow="hidden">
+              <AppTable apps={apps} stats={statsMap} selected={selectedApp} height={tableRows} />
+            </Box>
+            <TabBar view={view} columns={colBudget} filter={activeFilter} />
+            <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
+              {content}
+            </Box>
+          </>
+        ) : (
+          <>
+            <TabBar view={view} columns={colBudget} filter={activeFilter} />
+            <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
+              {content}
+            </Box>
+          </>
+        )}
       </Box>
       {cmdInput !== null ? (
         <CommandBar text={cmdInput} app={currentApp?.name} />

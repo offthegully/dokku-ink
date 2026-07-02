@@ -5,18 +5,27 @@ A terminal dashboard and command cheat sheet for [Dokku](https://dokku.com/), bu
 The dashboard views are **read-only** — they only observe. Anything that changes state goes through the explicit `:` command line (see below), so nothing mutates your server unless you typed it.
 
 ```
- dokku-dash · my-server                                       5 apps   LIVE
-╭──────────────────╮╭───────────────────────────────────────────────────────╮
-│ VIEWS            ││ APPS                                                  │
-│ › 1 Apps         ││ NAME        STATUS    PROCESSES      SSL    DOMAIN     │
-│   2 Domains & SSL││ blog        ● running web×2 worker×1 LE ✔   blog.…  +1 │
-│   3 Processes    ││ api         ● running web×3          LE ✔   api.example│
-│   4 Config / Env ││ staging     ○ stopped web×1          none   staging.…  │
-│   5 Logs         ││ metrics     ● running web×1          LE 4d… metrics.…  │
-│   6 Cheat Sheet  ││                                                        │
-╰──────────────────╯╰───────────────────────────────────────────────────────╯
- 1-6 view   tab focus list   ↑↓ change view   r refresh   q quit
+ dokku-dash · my-server                        ↻ 12s   disk 61%   5 apps   LIVE
+╭─────────────────────────────────────────────────────────────────────────────╮
+│   NAME       STATUS     PROCESSES       CPU    MEM    SSL     DOMAIN        │
+│ › blog       ● running  web×2 worker×1  2.8%   598M   LE ✔    blog.exam… +1 │
+│   api        ● running  web×3           14%    913M   LE ✔    api.example.… │
+│   staging    ○ stopped  web×1           —      —      none    staging.exam… │
+│                                                                             │
+│  1 Overview  2 Domains & SSL  3 Processes  4 Config / Env  5 Logs  6 Serv…  │
+│                                                                             │
+│  blog  ● running   cpu 2.8% · mem 598M                                      │
+│  DOMAINS  routing enabled              SSL CERTIFICATE                      │
+│   • blog.example.com  ✔ cert            Status: LE ✔ · expires 27d          │
+╰─────────────────────────────────────────────────────────────────────────────╯
+ 1-7 view  ←→ switch view  ↑↓ app  / filter  : command  r refresh  q quit
 ```
+
+Every per-app view shares one layout: the apps table stays on top (`↑`/`↓`
+selects an app), and the pane below it shows the selected tab — Overview,
+Domains & SSL, Processes, Config or Logs — for that app. `←`/`→` or the number
+keys switch tabs. Services and the Cheat Sheet aren't app-specific, so they
+take the full pane.
 
 ## Why no REST API?
 
@@ -110,11 +119,11 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 | Key            | Action                                        |
 | -------------- | --------------------------------------------- |
 | `1`–`7`        | Jump to a view                                |
-| `↑` / `↓` (`j`/`k`) | Move within the focused pane (scrollback in Logs) |
-| `←` / `→` (`h`/`l`) | Switch app (in per-app views)            |
-| `enter`        | Open the app detail drill-in; on the cheat sheet, insert the command into `:` |
-| `esc`          | Close detail/help, cancel a prompt, kill a running command |
-| `tab`          | Toggle focus between the menu and the list    |
+| `↑` / `↓`      | Select the app in the table (move the cursor in Services / Cheat Sheet) |
+| `←` / `→` (`h`/`l`), `tab` | Switch view                       |
+| `j` / `k`      | Scroll the detail pane (Logs scrollback, long Config lists) |
+| `enter`        | On the cheat sheet, insert the command into `:` |
+| `esc`          | Close help, cancel a prompt, kill a running command |
 | `/`            | Filter the app list (or the cheat sheet); `esc` clears |
 | `s`            | Reveal / hide secrets (Config values, service DSN) |
 | `R` / `S` / `B`| Prefill restart / stop / rebuild for the selected app (never auto-runs) |
@@ -125,23 +134,18 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 
 ### Views
 
-- **Apps** — every app with run status, process types × scale, live CPU/MEM usage (from `docker stats`), SSL summary and primary domain. `enter` drills into the selected app.
+- **Overview** — the default tab: created date, deploy source, restart policy, git branch/SHA/last-deploy, port mappings, persistent storage mounts, docker networks and linked datastore services for the selected app.
 - **Domains & SSL** — per-app vhosts, routing enabled/disabled, and certificate issuer + expiry (highlighted when expiring within 14 days).
 - **Processes** — per-process scale and individual container statuses with per-container CPU/memory, plus restart policy.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
-- **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
+- **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `j`/`k` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
 - **Services** — datastore services from the official plugin family (postgres, redis, mysql, mongo, …): status, version, and which apps each service is linked to. The selected service's DSN is masked until you press `s`.
 - **Cheat Sheet** — a filterable reference of the most useful `dokku` commands, grouped by area. `enter` inserts the selected command into the `:` prompt (with `<app>` pre-substituted as `$app`) so it doubles as a launcher.
 
-### App detail (`enter`)
-
-One pane with everything about the selected app: created date, deploy source,
-restart policy, live CPU/MEM, git branch/SHA/last-deploy (`git:report`), port
-mappings (`ports:report`), persistent storage mounts (`storage:list`), docker
-networks (`network:report`), domains + certificate expiry, and — once the
-Services view has loaded — the datastore services linked to it. `←`/`→` flips
-between apps without leaving the pane; the extra reports are fetched lazily and
-cached until the next full refresh.
+The Overview tab's drill-in reports (`git:report`, `ports:report`,
+`storage:list`, `network:report`) are fetched lazily for whatever app is
+selected and cached until the next full refresh, so holding `↑`/`↓` through
+the table doesn't fire a report sweep per row.
 
 ### Running commands
 
@@ -193,7 +197,7 @@ kept from the previous snapshot. That cuts subprocess churn ~75% without
 visible staleness — anything that would change the skipped reports (a deploy, a
 domain change) fires a full refresh through the events watcher anyway.
 
-Config is loaded lazily per app via `dokku config:show <app>` (JSON when available), datastore services via `dokku plugin:list` + `<plugin>:list` + `<plugin>:info`, and the app-detail reports (`ports`, `git`, `network`, `storage:list`) only when you open the drill-in — all silently refetched after each full refresh. Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
+Config is loaded lazily per app via `dokku config:show <app>` (JSON when available), datastore services via `dokku plugin:list` + `<plugin>:list` + `<plugin>:info`, and the app-detail reports (`ports`, `git`, `network`, `storage:list`) only for the selected app — all silently refetched after each full refresh. Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
 
 Three things make it feel live rather than polled:
 
