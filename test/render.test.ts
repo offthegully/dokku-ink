@@ -12,123 +12,123 @@ const { default: App } = await import('../src/App.js');
 
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
-test('renders the dashboard with demo data', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick(); // let loadOverview() resolve
+type Instance = ReturnType<typeof render>;
 
-  const frame = lastFrame() ?? '';
-  assert.match(frame, /dokku-dash/);
-  assert.match(frame, /DEMO DATA/);
-  assert.match(frame, /blog/); // first demo app
-  assert.match(frame, /Cheat Sheet/); // menu label
-  assert.match(frame, /CPU/); // usage columns from demo docker stats
-  assert.match(frame, /disk 61%/); // demo host disk in the header
+// Always unmount, even when an assertion throws — a mounted app's polling
+// intervals would otherwise keep the test process alive forever.
+async function withApp(fn: (inst: Instance) => Promise<void>): Promise<void> {
+  const inst = render(React.createElement(App));
+  try {
+    await tick(); // let loadOverview() resolve
+    await fn(inst);
+  } finally {
+    inst.unmount();
+  }
+}
 
-  stdin.write('7'); // Cheat Sheet view
-  await tick(20);
-  assert.match(lastFrame() ?? '', /dokku apps:list|Deploy|Process/);
+test('renders the dashboard with demo data', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /dokku-dash/);
+    assert.match(frame, /DEMO DATA/);
+    assert.match(frame, /blog/); // first demo app
+    assert.match(frame, /Cheats|Cheat Sheet/); // tab-bar label (short on narrow terms)
+    assert.match(frame, /CPU/); // usage columns from demo docker stats
+    assert.match(frame, /disk 61%/); // demo host disk in the header
 
-  stdin.write('5'); // Logs view (demo generator)
-  await tick(20);
-  assert.match(lastFrame() ?? '', /dokku logs -t/);
+    stdin.write('7'); // Cheat Sheet view
+    await tick(20);
+    assert.match(lastFrame() ?? '', /dokku apps:list|Deploy|Process/);
 
-  unmount();
-});
+    stdin.write('5'); // Logs view (demo generator)
+    await tick(20);
+    assert.match(lastFrame() ?? '', /dokku logs -t/);
+  }));
 
-test('services view lists demo datastores and masks the DSN', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('6'); // Services view
-  await tick(40); // let loadServices() resolve
-  const frame = lastFrame() ?? '';
-  assert.match(frame, /blog-db/);
-  assert.match(frame, /postgres/);
-  assert.match(frame, /LINKED APPS/);
-  assert.doesNotMatch(frame, /s3cr3t/); // DSN masked by default
-  stdin.write('s'); // reveal
-  await tick(20);
-  assert.match(lastFrame() ?? '', /postgres:\/\//);
-  unmount();
-});
+test('services view lists demo datastores and masks the DSN', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('6'); // Services view
+    await tick(40); // let loadServices() resolve
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /blog-db/);
+    assert.match(frame, /postgres/);
+    assert.match(frame, /api-cache/); // redis service listed too
+    assert.doesNotMatch(frame, /s3cr3t/); // DSN masked by default
+    stdin.write('s'); // reveal
+    await tick(20);
+    assert.match(lastFrame() ?? '', /postgres:\/\//);
+  }));
 
-test('enter opens the app detail drill-in and esc closes it', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('\r'); // enter on the Apps view (blog selected)
-  await tick(40); // let loadAppDetail() resolve
-  const frame = lastFrame() ?? '';
-  assert.match(frame, /APP DETAIL/);
-  assert.match(frame, /PORTS/);
-  assert.match(frame, /http:80:5000/);
-  assert.match(frame, /STORAGE/);
-  stdin.write(''); // escape closes
-  await tick(20);
-  assert.doesNotMatch(lastFrame() ?? '', /APP DETAIL/);
-  unmount();
-});
+test('apps view auto-loads the selected app summary pane', () =>
+  withApp(async ({ lastFrame }) => {
+    await tick(300); // debounce + loadAppDetail() for the selected row
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /GIT/);
+    assert.match(frame, /PORTS/);
+    assert.match(frame, /http:80:5000/);
+    assert.match(frame, /STORAGE/);
+    assert.match(frame, /blog-db/); // linked service in the summary
+  }));
 
-test('`/` filters the app list live', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('/');
-  await tick(20);
-  stdin.write('api');
-  await tick(20);
-  const frame = lastFrame() ?? '';
-  assert.match(frame, /api/);
-  assert.doesNotMatch(frame, /\bblog\b/); // filtered out of the table
-  stdin.write(''); // esc clears the filter
-  await tick(20);
-  assert.match(lastFrame() ?? '', /blog/);
-  unmount();
-});
+test('tab cycles to the next view', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('\t');
+    await tick(20);
+    assert.match(lastFrame() ?? '', /DOMAINS & SSL/); // pane title of view 2
+  }));
 
-test('`?` opens the help overlay', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('?');
-  await tick(20);
-  assert.match(lastFrame() ?? '', /HELP/);
-  stdin.write('');
-  await tick(20);
-  assert.doesNotMatch(lastFrame() ?? '', /HELP/);
-  unmount();
-});
+test('`/` filters the app list live', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('/');
+    await tick(20);
+    stdin.write('api');
+    await tick(20);
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /api/);
+    assert.doesNotMatch(frame, /\bblog\b/); // filtered out of the table
+    stdin.write(''); // esc clears the filter
+    await tick(20);
+    assert.match(lastFrame() ?? '', /blog/);
+  }));
 
-test('cheat sheet enter prefills the `:` prompt', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('7'); // Cheat Sheet
-  await tick(20);
-  stdin.write('\r'); // first item: dokku apps:list
-  await tick(20);
-  assert.match(lastFrame() ?? '', /: dokku apps:list/);
-  unmount();
-});
+test('`?` opens the help overlay', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('?');
+    await tick(20);
+    assert.match(lastFrame() ?? '', /HELP/);
+    stdin.write('');
+    await tick(20);
+    assert.doesNotMatch(lastFrame() ?? '', /HELP/);
+  }));
 
-test('`:` opens the command bar and escape closes it', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write(':');
-  await tick(20);
-  assert.match(lastFrame() ?? '', /: dokku/);
-  stdin.write('ps:restart');
-  await tick(20);
-  assert.match(lastFrame() ?? '', /ps:restart/);
-  stdin.write(''); // escape — cancel without running
-  await tick(20);
-  assert.doesNotMatch(lastFrame() ?? '', /: dokku/);
-  unmount();
-});
+test('cheat sheet enter prefills the `:` prompt', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('7'); // Cheat Sheet
+    await tick(20);
+    stdin.write('\r'); // first item: dokku apps:list
+    await tick(20);
+    assert.match(lastFrame() ?? '', /: dokku apps:list/);
+  }));
 
-test('config view masks values until revealed', async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(App));
-  await tick();
-  stdin.write('4'); // Config / Env view
-  await tick(40);
-  assert.match(lastFrame() ?? '', /reveal/); // hint shown, values masked
-  stdin.write('s'); // reveal
-  await tick(20);
-  assert.match(lastFrame() ?? '', /hide/);
-  unmount();
-});
+test('`:` opens the command bar and escape closes it', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write(':');
+    await tick(20);
+    assert.match(lastFrame() ?? '', /: dokku/);
+    stdin.write('ps:restart');
+    await tick(20);
+    assert.match(lastFrame() ?? '', /ps:restart/);
+    stdin.write(''); // escape — cancel without running
+    await tick(20);
+    assert.doesNotMatch(lastFrame() ?? '', /: dokku/);
+  }));
+
+test('config view masks values until revealed', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('4'); // Config / Env view
+    await tick(40);
+    assert.match(lastFrame() ?? '', /reveal/); // hint shown, values masked
+    stdin.write('s'); // reveal
+    await tick(20);
+    assert.match(lastFrame() ?? '', /hide/);
+  }));

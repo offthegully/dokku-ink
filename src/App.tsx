@@ -8,6 +8,7 @@ import {
   truncate,
   padEnd,
   fmtAge,
+  fmtAgeDays,
   fmtBytes,
   fmtDate,
   fmtPct,
@@ -46,17 +47,19 @@ import type {
 interface ViewDef {
   key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'services' | 'cheatsheet';
   label: string;
+  /** Compact label for the tab bar on narrow terminals. */
+  short: string;
   perApp: boolean;
 }
 
 const VIEWS: ViewDef[] = [
-  { key: 'apps', label: 'Apps', perApp: false },
-  { key: 'domains', label: 'Domains & SSL', perApp: true },
-  { key: 'process', label: 'Processes', perApp: true },
-  { key: 'config', label: 'Config / Env', perApp: true },
-  { key: 'logs', label: 'Logs', perApp: true },
-  { key: 'services', label: 'Services', perApp: false },
-  { key: 'cheatsheet', label: 'Cheat Sheet', perApp: false },
+  { key: 'apps', label: 'Apps', short: 'Apps', perApp: false },
+  { key: 'domains', label: 'Domains & SSL', short: 'Domains', perApp: true },
+  { key: 'process', label: 'Processes', short: 'Procs', perApp: true },
+  { key: 'config', label: 'Config / Env', short: 'Config', perApp: true },
+  { key: 'logs', label: 'Logs', short: 'Logs', perApp: true },
+  { key: 'services', label: 'Services', short: 'Services', perApp: false },
+  { key: 'cheatsheet', label: 'Cheat Sheet', short: 'Cheats', perApp: false },
 ];
 
 // Auto-refresh cadence for overview data. Configurable via DOKKU_DASH_REFRESH
@@ -84,8 +87,6 @@ interface LogLine {
   text: string;
   err: boolean;
 }
-
-type Focus = 'menu' | 'content';
 
 // Single-key actions that prefill (never auto-run) the `:` prompt for the
 // selected app. Uppercase so they can't collide with navigation keys.
@@ -191,15 +192,29 @@ function Header({
   );
 }
 
-function Menu({ view, focused }: { view: number; focused: boolean }): ReactNode {
+// One-line view switcher under the header. Full labels when they fit, compact
+// ones otherwise — either way the digits stay visible as the hotkeys.
+function TabBar({ view, columns }: { view: number; columns: number }): ReactNode {
+  const fullWidth = VIEWS.reduce((s, v, i) => s + String(i + 1).length + v.label.length + 5, 2);
+  const useShort = fullWidth > columns;
   return (
-    <Box flexDirection="column" width={24} flexShrink={0} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
-      <Text color={theme.dim}>VIEWS</Text>
+    <Box paddingX={1}>
       {VIEWS.map((v, i) => {
         const sel = i === view;
+        const label = ` ${i + 1} ${useShort ? v.short : v.label} `;
         return (
-          <Text key={v.key} wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.text}>
-            {sel ? '›' : ' '} {i + 1} {padEnd(v.label, 14)}
+          <Text key={v.key}>
+            {sel ? (
+              <Text backgroundColor={theme.accent} color="black" bold>
+                {label}
+              </Text>
+            ) : (
+              <Text>
+                <Text color={theme.accent}> {i + 1} </Text>
+                <Text color={theme.dim}>{useShort ? v.short : v.label} </Text>
+              </Text>
+            )}
+            <Text> </Text>
           </Text>
         );
       })}
@@ -210,19 +225,20 @@ function Menu({ view, focused }: { view: number; focused: boolean }): ReactNode 
 function AppSelector({
   apps,
   selected,
-  focused,
   height,
   filter,
+  width,
 }: {
   apps: DokkuApp[];
   selected: number;
-  focused: boolean;
   height: number;
   filter: string;
+  width: number;
 }): ReactNode {
   const { start, items } = windowed(apps, selected, height);
+  const nameW = Math.max(8, width - 8); // borders + padding + status dot
   return (
-    <Box flexDirection="column" width={20} flexShrink={0} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
+    <Box flexDirection="column" width={width} flexShrink={0} borderStyle="round" borderColor={theme.dim} paddingX={1}>
       <Text wrap="truncate-end" color={theme.dim}>APPS{filter ? <Text color={theme.warn}> /{filter}</Text> : null}</Text>
       {items.map((a, i) => {
         const idx = start + i;
@@ -231,8 +247,8 @@ function AppSelector({
         return (
           <Box key={a.name}>
             <Text color={dot}>{sel ? '●' : '·'} </Text>
-            <Text wrap="truncate-end" backgroundColor={sel && focused ? theme.accent : undefined} color={sel && focused ? 'black' : theme.text}>
-              {padEnd(a.name, 12)}
+            <Text wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.text}>
+              {padEnd(a.name, nameW)}
             </Text>
           </Box>
         );
@@ -242,25 +258,42 @@ function AppSelector({
   );
 }
 
-function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode {
+function Footer({ view, columns }: { view: number; columns: number }): ReactNode {
   const v = VIEWS[view];
-  const keys: Array<[string, string]> = [
-    [`1-${VIEWS.length}`, 'view'],
-    ['tab', focused === 'menu' ? 'focus list' : 'focus menu'],
-    ['↑↓', focused === 'menu' ? 'change view' : v.key === 'logs' ? 'scroll logs' : 'move'],
+  // [key, label, priority] — on narrow terminals the lowest-priority hints are
+  // dropped whole rather than letting the layout squeeze every label. `?` is
+  // kept at all costs: it's how the remaining keys stay discoverable.
+  const keys: Array<[string, string, number]> = [
+    [`1-${VIEWS.length}`, 'view', 4],
+    ['tab', 'next view', 3],
+    ['↑↓', v.key === 'logs' ? 'scroll logs' : 'move', 9],
   ];
-  if (v.perApp) keys.push(['←→', 'app']);
-  if (v.key === 'apps' || v.perApp) keys.push(['↵', 'detail']);
-  if (v.key === 'cheatsheet') keys.push(['↵', 'insert cmd']);
-  if (v.key === 'apps' || v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter']);
-  if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal']);
-  keys.push([':', 'command']);
-  keys.push(['r', 'refresh']);
-  keys.push(['?', 'help']);
-  keys.push(['q', 'quit']);
+  if (v.perApp) keys.push(['←→', 'app', 6]);
+  if (v.key === 'cheatsheet') keys.push(['↵', 'insert cmd', 8]);
+  if (v.key === 'apps' || v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter', 5]);
+  if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
+  keys.push([':', 'command', 7]);
+  keys.push(['r', 'refresh', 2]);
+  keys.push(['?', 'help', 10]);
+  keys.push(['q', 'quit', 8]);
+
+  const width = (k: string, label: string) => k.length + label.length + 3; // "k label  "
+  let total = keys.reduce((s, [k, label]) => s + width(k, label), 0) + 2;
+  const dropped = new Set<number>();
+  if (total > columns) {
+    const order = keys
+      .map((entry, i) => ({ pri: entry[2], i }))
+      .sort((a, b) => a.pri - b.pri);
+    for (const { i } of order) {
+      if (total <= columns) break;
+      dropped.add(i);
+      total -= width(keys[i][0], keys[i][1]);
+    }
+  }
+  const shown = keys.filter((_, i) => !dropped.has(i));
   return (
     <Box paddingX={1}>
-      {keys.map(([k, label], i) => (
+      {shown.map(([k, label], i) => (
         <Text key={k}>
           <Text color={theme.accent} bold>
             {k}
@@ -268,7 +301,7 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
           <Text color={theme.dim}>
             {' '}
             {label}
-            {i < keys.length - 1 ? '  ' : ''}
+            {i < shown.length - 1 ? '  ' : ''}
           </Text>
         </Text>
       ))}
@@ -312,18 +345,106 @@ function FilterBar({ text, target }: { text: string; target: string }): ReactNod
 // Views
 // ---------------------------------------------------------------------------
 
+// Rows the summary pane under the apps table occupies (separator included).
+const SUMMARY_ROWS = 9;
+
+// Compact always-visible drill-in for the selected app, rendered under the
+// apps table — replaces the old Enter-to-open detail overlay.
+function AppSummary({
+  app,
+  detail,
+  loading,
+  services,
+  width,
+}: {
+  app: DokkuApp;
+  detail?: AppDetail;
+  loading: boolean;
+  services: DokkuService[] | null;
+  width: number;
+}): ReactNode {
+  const linked = (services ?? []).filter((s) => s.links.includes(app.name));
+  const lbl = (t: string) => <Text color={theme.dim}>{padEnd(t, 9)}</Text>;
+  return (
+    <Box flexDirection="column">
+      <Text> </Text>
+      <Text color={theme.dim}>{'─'.repeat(Math.max(10, width))}</Text>
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {app.name}
+        </Text>
+        <Text color={theme.dim}>
+          {'  '}created {fmtDate(app.createdAt)} · deploy {app.deploySource || '—'} · restart {app.restartPolicy || '—'}
+        </Text>
+      </Text>
+      {detail ? (
+        <>
+          <Text wrap="truncate-end">
+            {lbl('GIT')}
+            {detail.git.sourceImage ? (
+              `image ${detail.git.sourceImage}`
+            ) : detail.git.sha || detail.git.branch ? (
+              `branch ${detail.git.branch ?? '—'} · sha ${detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed ${fmtDate(detail.git.lastUpdated)}`
+            ) : (
+              <Text color={theme.dim}>(no git metadata)</Text>
+            )}
+          </Text>
+          <Text wrap="truncate-end">
+            {lbl('PORTS')}
+            {detail.ports.length > 0 ? detail.ports.join(' · ') : <Text color={theme.dim}>(none mapped)</Text>}
+          </Text>
+          <Text wrap="truncate-end">
+            {lbl('STORAGE')}
+            {detail.storage.length > 0 ? detail.storage.join(' · ') : <Text color={theme.dim}>(no persistent mounts)</Text>}
+          </Text>
+          <Text wrap="truncate-end">
+            {lbl('NETWORK')}
+            {detail.network.initial ?? '—'}
+            {detail.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
+            {detail.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
+          </Text>
+        </>
+      ) : (
+        <Text color={theme.dim}>{loading ? 'Loading detail reports…' : ' '}</Text>
+      )}
+      <Text wrap="truncate-end">
+        {lbl('LINKED')}
+        {services === null ? (
+          <Text color={theme.dim}>…</Text>
+        ) : linked.length === 0 ? (
+          <Text color={theme.dim}>(none)</Text>
+        ) : (
+          linked.map((s, i) => (
+            <Text key={`${s.plugin}/${s.name}`}>
+              {i > 0 ? ' · ' : ''}
+              {s.plugin}/{s.name}{' '}
+              <Text color={s.status && /run/i.test(s.status) ? theme.good : theme.warn}>{s.status ?? '?'}</Text>
+            </Text>
+          ))
+        )}
+      </Text>
+    </Box>
+  );
+}
+
 function AppsView({
   apps,
   stats,
   selected,
-  focused,
   viewport,
+  width,
+  detail,
+  detailLoading,
+  services,
 }: {
   apps: DokkuApp[];
   stats: StatsMap | null;
   selected: number;
-  focused: boolean;
   viewport: number;
+  width: number;
+  detail?: AppDetail;
+  detailLoading: boolean;
+  services: DokkuService[] | null;
 }): ReactNode {
   if (apps.length === 0) return <Text color={theme.dim}>No apps found.</Text>;
   // Fixed-width columns first, then the flexible DOMAIN column last so it can
@@ -331,11 +452,17 @@ function AppsView({
   // narrow terminal degrades gracefully instead of wrapping the grid.
   const nameW = Math.min(28, Math.max(10, ...apps.map((a) => a.name.length)) + 2);
   const statusW = 15;
-  const procW = 13;
+  const procW = 16;
   const cpuW = 7;
   const memW = 7;
+  const ageW = 6;
   const sslW = 11;
-  const { start, items } = windowed(apps, selected, viewport - 1);
+  // The summary pane only appears when the terminal is tall enough to keep a
+  // useful table above it.
+  const showSummary = viewport >= SUMMARY_ROWS + 5;
+  const tableRows = showSummary ? Math.max(4, viewport - SUMMARY_ROWS) : viewport;
+  const { start, items } = windowed(apps, selected, tableRows - 1);
+  const sel = apps[selected];
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end" color={theme.dim}>
@@ -345,11 +472,12 @@ function AppsView({
           padEnd('PROCESSES', procW) +
           padEnd('CPU', cpuW) +
           padEnd('MEM', memW) +
+          padEnd('AGE', ageW) +
           padEnd('SSL', sslW) +
           'DOMAIN'}
       </Text>
       {items.map((a, i) => {
-        const sel = start + i === selected;
+        const isSel = start + i === selected;
         const rb = runningBadge(a);
         const proc = a.processes.map((p) => `${p.type}×${p.scale}`).join(' ') || '—';
         const domain =
@@ -358,8 +486,8 @@ function AppsView({
         const usage = appUsage(a, stats);
         return (
           <Box key={a.name}>
-            <Text color={theme.accent}>{sel ? '› ' : '  '}</Text>
-            <Text wrap="truncate-end" bold backgroundColor={sel && focused ? theme.accent : undefined} color={sel && focused ? 'black' : theme.text}>
+            <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
+            <Text wrap="truncate-end" bold backgroundColor={isSel ? theme.accent : undefined} color={isSel ? 'black' : theme.text}>
               {padEnd(a.name, nameW)}
             </Text>
             <Text wrap="truncate-end" color={rb.color}>{padEnd(rb.text, statusW)}</Text>
@@ -368,60 +496,136 @@ function AppsView({
               {padEnd(fmtPct(usage.cpu), cpuW)}
             </Text>
             <Text wrap="truncate-end" color={theme.dim}>{padEnd(fmtBytes(usage.mem), memW)}</Text>
+            <Text wrap="truncate-end" color={theme.dim}>{padEnd(fmtAgeDays(a.createdAt), ageW)}</Text>
             <Text wrap="truncate-end" color={sb.color}>{padEnd(sb.text, sslW)}</Text>
             <Text wrap="truncate-end" color={theme.dim}>{domain}</Text>
           </Box>
         );
       })}
       {windowHint(apps.length, start, items.length)}
+      {showSummary && sel ? (
+        <AppSummary app={sel} detail={detail} loading={detailLoading} services={services} width={width} />
+      ) : null}
     </Box>
   );
 }
 
-function DomainsView({ app }: { app?: DokkuApp }): ReactNode {
+// Shared first line of every per-app view: name, run state, live usage.
+function AppHeader({ app, stats, extra }: { app: DokkuApp; stats: StatsMap | null; extra?: string }): ReactNode {
+  const rb = runningBadge(app);
+  const usage = appUsage(app, stats);
+  return (
+    <>
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {app.name}
+        </Text>
+        {'  '}
+        <Text color={rb.color}>{rb.text}</Text>
+        <Text color={theme.dim}>
+          {usage.cpu !== null || usage.mem !== null ? `   cpu ${fmtPct(usage.cpu)} · mem ${fmtBytes(usage.mem)}` : ''}
+          {extra ?? ''}
+        </Text>
+      </Text>
+      <Text> </Text>
+    </>
+  );
+}
+
+// Whether the app's certificate covers a domain (wildcard-aware); null when
+// there is no cert to check against.
+function certCovers(domain: string, ssl: DokkuApp['ssl']): boolean | null {
+  if (!ssl?.enabled || ssl.hostnames.length === 0) return null;
+  return ssl.hostnames.some((h) =>
+    h.startsWith('*.')
+      ? domain.endsWith(h.slice(1)) && domain.split('.').length === h.split('.').length
+      : h === domain,
+  );
+}
+
+function DomainsView({
+  app,
+  detail,
+  stats,
+  width,
+}: {
+  app?: DokkuApp;
+  detail?: AppDetail;
+  stats: StatsMap | null;
+  width: number;
+}): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
   const sb = sslBadge(app.ssl);
   const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
+  const leftW = Math.min(64, Math.max(28, Math.floor(width * 0.55)));
   return (
     <Box flexDirection="column">
-      <Text bold color={theme.accent}>
-        {app.name}
-      </Text>
-      <Text>
-        Routing:{' '}
-        {app.domainsEnabled === false ? (
-          <Text color={theme.warn}>disabled</Text>
-        ) : (
-          <Text color={theme.good}>enabled</Text>
-        )}
-      </Text>
-      <Text> </Text>
-      <Text color={theme.dim}>DOMAINS</Text>
-      {app.domains.length === 0 ? (
-        <Text color={theme.dim}> (none set)</Text>
-      ) : (
-        app.domains.map((d, i) => (
-          <Text key={i} wrap="truncate-end">
-            {' '}• {d}
+      <AppHeader app={app} stats={stats} />
+      <Box>
+        <Box flexDirection="column" width={leftW} flexShrink={0} marginRight={2}>
+          <Text wrap="truncate-end" color={theme.dim}>
+            DOMAINS{'  '}
+            {app.domainsEnabled === false ? (
+              <Text color={theme.warn}>routing disabled</Text>
+            ) : (
+              <Text color={theme.good}>routing enabled</Text>
+            )}
           </Text>
-        ))
-      )}
-      <Text> </Text>
-      <Text color={theme.dim}>SSL CERTIFICATE</Text>
-      <Text wrap="truncate-end">
-        {' '}
-        Status: <Text color={sb.color}>{sb.text}</Text>
-      </Text>
-      {app.ssl ? (
-        <>
-          {app.ssl.issuer ? <Text wrap="truncate-end"> Issuer: {app.ssl.issuer}</Text> : null}
+          {app.domains.length === 0 ? (
+            <Text color={theme.dim}> (none set)</Text>
+          ) : (
+            app.domains.map((d) => {
+              const cov = certCovers(d, app.ssl);
+              return (
+                <Text key={d} wrap="truncate-end">
+                  {' '}• {d}
+                  {cov === null ? null : cov ? (
+                    <Text color={theme.good}>  ✔ cert</Text>
+                  ) : (
+                    <Text color={theme.warn}>  ✗ no cert</Text>
+                  )}
+                </Text>
+              );
+            })
+          )}
+          <Text> </Text>
+          <Text color={theme.dim}>PORTS</Text>
+          {!detail ? (
+            <Text color={theme.dim}> …</Text>
+          ) : detail.ports.length === 0 ? (
+            <Text color={theme.dim}> (none mapped)</Text>
+          ) : (
+            detail.ports.map((p) => (
+              <Text key={p} wrap="truncate-end">
+                {' '}• {p}
+              </Text>
+            ))
+          )}
+        </Box>
+        <Box flexDirection="column" flexGrow={1}>
+          <Text color={theme.dim}>SSL CERTIFICATE</Text>
           <Text wrap="truncate-end">
             {' '}
-            Expires: {fmtDate(app.ssl.expiresAt)}
-            {days !== null ? <Text color={days <= 14 ? theme.warn : theme.dim}> ({days}d)</Text> : null}
+            Status: <Text color={sb.color}>{sb.text}</Text>
           </Text>
-        </>
-      ) : null}
+          {app.ssl ? (
+            <>
+              {app.ssl.issuer ? <Text wrap="truncate-end"> Issuer: {app.ssl.issuer}</Text> : null}
+              <Text wrap="truncate-end">
+                {' '}
+                Expires: {fmtDate(app.ssl.expiresAt)}
+                {days !== null ? <Text color={days <= 14 ? theme.warn : theme.dim}> ({days}d)</Text> : null}
+              </Text>
+              {app.ssl.verified !== null ? (
+                <Text wrap="truncate-end">
+                  {' '}
+                  Verified: <Text color={app.ssl.verified ? theme.good : theme.warn}>{app.ssl.verified ? 'yes' : 'no'}</Text>
+                </Text>
+              ) : null}
+            </>
+          ) : null}
+        </Box>
+      </Box>
     </Box>
   );
 }
@@ -433,30 +637,32 @@ function statusColor(s: string): string {
   return theme.warn;
 }
 
-function ProcessView({ app, stats }: { app?: DokkuApp; stats: StatsMap | null }): ReactNode {
+function ProcessView({
+  app,
+  stats,
+  detail,
+}: {
+  app?: DokkuApp;
+  stats: StatsMap | null;
+  detail?: AppDetail;
+}): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
-  const rb = runningBadge(app);
   return (
     <Box flexDirection="column">
-      <Text bold color={theme.accent}>
-        {app.name}
-      </Text>
-      <Text>
-        State: <Text color={rb.color}>{rb.text}</Text>
-        {'   '}Restart: {app.restartPolicy || '—'}
-      </Text>
-      <Text> </Text>
-      {app.processes.length === 0 ? <Text color={theme.dim}>No process info (not deployed?)</Text> : null}
+      <AppHeader app={app} stats={stats} extra={`   restart ${app.restartPolicy || '—'}`} />
+      <Text color={theme.dim}>PROCESSES</Text>
+      {app.processes.length === 0 ? <Text color={theme.dim}> No process info (not deployed?)</Text> : null}
       {app.processes.map((p) => (
         <Box key={p.type} flexDirection="column">
           <Text bold>
+            {' '}
             {p.type} <Text color={theme.dim}>scale {p.scale}</Text>
           </Text>
           {p.instances.map((inst) => {
             const s = stats?.[`${app.name}.${p.type}.${inst.index}`];
             return (
               <Text key={inst.index} wrap="truncate-end">
-                {'  '}
+                {'   '}
                 {p.type}.{inst.index}{'  '}
                 <Text color={statusColor(inst.status)}>{inst.status}</Text>
                 {s ? (
@@ -470,6 +676,24 @@ function ProcessView({ app, stats }: { app?: DokkuApp; stats: StatsMap | null })
           })}
         </Box>
       ))}
+      <Text> </Text>
+      <Text color={theme.dim}>DEPLOY</Text>
+      <Text wrap="truncate-end">
+        {' '}via {app.deploySource || '—'}
+        {detail?.git.sourceImage ? ` · image ${detail.git.sourceImage}` : ''}
+        {detail && !detail.git.sourceImage && (detail.git.branch || detail.git.sha)
+          ? ` · branch ${detail.git.branch ?? '—'} · sha ${detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed ${fmtDate(detail.git.lastUpdated)}`
+          : ''}
+        <Text color={theme.dim}> · created {fmtDate(app.createdAt)}</Text>
+      </Text>
+      <Text> </Text>
+      <Text color={theme.dim}>NETWORK</Text>
+      <Text wrap="truncate-end">
+        {' '}initial {detail?.network.initial ?? '—'}
+        {detail?.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
+        {detail?.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
+        {detail && detail.ports.length > 0 ? <Text color={theme.dim}> · ports {detail.ports.join(', ')}</Text> : null}
+      </Text>
     </Box>
   );
 }
@@ -577,14 +801,12 @@ function ServicesView({
   services,
   loading,
   cursor,
-  focused,
   reveal,
   viewport,
 }: {
   services: DokkuService[] | null;
   loading: boolean;
   cursor: number;
-  focused: boolean;
   reveal: boolean;
   viewport: number;
 }): ReactNode {
@@ -622,7 +844,7 @@ function ServicesView({
           <Box key={`${s.plugin}/${s.name}`}>
             <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
             <Text wrap="truncate-end" color={theme.dim}>{padEnd(s.plugin, pluginW)}</Text>
-            <Text wrap="truncate-end" bold backgroundColor={isSel && focused ? theme.accent : undefined} color={isSel && focused ? 'black' : theme.text}>
+            <Text wrap="truncate-end" bold backgroundColor={isSel ? theme.accent : undefined} color={isSel ? 'black' : theme.text}>
               {padEnd(s.name, nameW)}
             </Text>
             <Text wrap="truncate-end" color={stColor}>{padEnd(s.status ?? '?', statusW)}</Text>
@@ -652,114 +874,14 @@ function ServicesView({
   );
 }
 
-function DetailView({
-  app,
-  detail,
-  loading,
-  services,
-  stats,
-}: {
-  app?: DokkuApp;
-  detail?: AppDetail;
-  loading: boolean;
-  services: DokkuService[] | null;
-  stats: StatsMap | null;
-}): ReactNode {
-  if (!app) return <Text color={theme.dim}>No app selected.</Text>;
-  const rb = runningBadge(app);
-  const usage = appUsage(app, stats);
-  const linked = (services ?? []).filter((s) => s.links.includes(app.name));
-  const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
-  const sb = sslBadge(app.ssl);
-  return (
-    <Box flexDirection="column">
-      <Text wrap="truncate-end">
-        <Text bold color={theme.accent}>{app.name}</Text>
-        {'  '}
-        <Text color={rb.color}>{rb.text}</Text>
-        <Text color={theme.dim}>   esc closes · ←→ other apps</Text>
-      </Text>
-      <Text wrap="truncate-end" color={theme.dim}>
-        created {fmtDate(app.createdAt)} · deploy {app.deploySource || '—'} · restart {app.restartPolicy || '—'}
-        {usage.cpu !== null || usage.mem !== null ? ` · cpu ${fmtPct(usage.cpu)} · mem ${fmtBytes(usage.mem)}` : ''}
-      </Text>
-      <Text> </Text>
-      {loading && !detail ? <Text color={theme.dim}>Loading detail reports…</Text> : null}
-      {detail ? (
-        <>
-          <Text color={theme.dim}>GIT</Text>
-          {detail.git.sourceImage ? (
-            <Text wrap="truncate-end"> image {detail.git.sourceImage}</Text>
-          ) : detail.git.sha || detail.git.branch ? (
-            <Text wrap="truncate-end">
-              {' '}branch {detail.git.branch ?? '—'} · sha {detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed{' '}
-              {fmtDate(detail.git.lastUpdated)}
-            </Text>
-          ) : (
-            <Text color={theme.dim}> (no git metadata)</Text>
-          )}
-          <Text> </Text>
-          <Text color={theme.dim}>PORTS</Text>
-          {detail.ports.length === 0 ? (
-            <Text color={theme.dim}> (none mapped)</Text>
-          ) : (
-            detail.ports.map((p) => (
-              <Text key={p} wrap="truncate-end"> • {p}</Text>
-            ))
-          )}
-          <Text> </Text>
-          <Text color={theme.dim}>STORAGE</Text>
-          {detail.storage.length === 0 ? (
-            <Text color={theme.dim}> (no persistent mounts)</Text>
-          ) : (
-            detail.storage.map((s) => (
-              <Text key={s} wrap="truncate-end"> • {s}</Text>
-            ))
-          )}
-          <Text> </Text>
-          <Text color={theme.dim}>NETWORK</Text>
-          <Text wrap="truncate-end">
-            {' '}initial {detail.network.initial ?? '—'}
-            {detail.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
-            {detail.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
-          </Text>
-          <Text> </Text>
-        </>
-      ) : null}
-      <Text color={theme.dim}>DOMAINS & SSL</Text>
-      <Text wrap="truncate-end">
-        {' '}
-        {app.domains.length === 0 ? '(no domains)' : app.domains.join(' · ')}
-      </Text>
-      <Text wrap="truncate-end">
-        {' '}ssl <Text color={sb.color}>{sb.text}</Text>
-        {app.ssl && days !== null ? <Text color={theme.dim}> · expires {fmtDate(app.ssl.expiresAt)} ({days}d)</Text> : null}
-      </Text>
-      <Text> </Text>
-      <Text color={theme.dim}>LINKED SERVICES</Text>
-      {services === null ? (
-        <Text color={theme.dim}> (open the Services view once to load links)</Text>
-      ) : linked.length === 0 ? (
-        <Text color={theme.dim}> (none)</Text>
-      ) : (
-        linked.map((s) => (
-          <Text key={`${s.plugin}/${s.name}`} wrap="truncate-end">
-            {' '}• {s.plugin}/{s.name} <Text color={s.status && /run/i.test(s.status) ? theme.good : theme.warn}>{s.status ?? '?'}</Text>
-          </Text>
-        ))
-      )}
-    </Box>
-  );
-}
-
 function HelpView(): ReactNode {
   const rows: Array<[string, string] | null> = [
     ['1-7', 'jump to a view'],
-    ['tab', 'toggle focus between menu and list/content'],
+    ['tab / shift-tab', 'next / previous view'],
     ['↑↓ / jk', 'move selection · scroll logs/config'],
     ['←→ / hl', 'switch app in per-app views'],
-    ['enter', 'open app detail (Apps & per-app views) · insert cheat-sheet command'],
-    ['esc', 'close detail/help · cancel prompt · kill running command'],
+    ['enter', 'insert cheat-sheet command into the `:` prompt'],
+    ['esc', 'close help · cancel prompt · kill running command'],
     ['/', 'filter the app list (or cheat sheet) · esc clears'],
     ['s', 'reveal/hide secrets (Config values, service DSN)'],
     null,
@@ -866,13 +988,11 @@ function CheatsheetView({
   width,
   viewport,
   cursor,
-  focused,
   filter,
 }: {
   width: number;
   viewport: number;
   cursor: number;
-  focused: boolean;
   filter: string;
 }): ReactNode {
   const lines = cheatLines(filter);
@@ -894,7 +1014,7 @@ function CheatsheetView({
         return (
           <Box key={idx}>
             <Text color={theme.accent}>{sel ? '›' : ' '}</Text>
-            <Text wrap="truncate-end" backgroundColor={sel && focused ? theme.accent : undefined} color={sel && focused ? 'black' : theme.good}>
+            <Text wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.good}>
               {padEnd(truncate(l.cmd, cmdW), cmdW)}
             </Text>
             <Text wrap="truncate-end" color={theme.dim}> {l.desc}</Text>
@@ -933,14 +1053,12 @@ export default function App(): ReactNode {
   const { columns, rows } = useTerminalSize();
 
   const [view, setView] = useState(0);
-  const [focus, setFocus] = useState<Focus>('menu');
   const [selectedApp, setSelectedApp] = useState(0);
   const [scroll, setScroll] = useState(0);
   const [reveal, setReveal] = useState(false);
   const [svcReveal, setSvcReveal] = useState(false);
   const [svcCursor, setSvcCursor] = useState(0);
   const [cheatCursor, setCheatCursor] = useState(1); // first item under first group
-  const [detailOpen, setDetailOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
   const [data, setData] = useState<Overview | null>(null);
@@ -1108,7 +1226,6 @@ export default function App(): ReactNode {
 
   useEffect(() => {
     setScroll(0);
-    setDetailOpen(false);
   }, [view]);
 
   useEffect(() => {
@@ -1194,9 +1311,10 @@ export default function App(): ReactNode {
     };
   }, [currentView.key, currentApp, source, configCache, dataV]);
 
-  // Lazily load datastore services on first visit; refetch when dataV moves.
+  // Lazily load datastore services when a view needs them (Services itself,
+  // plus the Apps summary pane's LINKED line); refetch when dataV moves.
   useEffect(() => {
-    if (currentView.key !== 'services') return;
+    if (currentView.key !== 'services' && currentView.key !== 'apps') return;
     if (services && services.v === dataV) return;
     let cancelled = false;
     if (!services) setServicesLoading(true);
@@ -1210,31 +1328,39 @@ export default function App(): ReactNode {
     };
   }, [currentView.key, services, dataV]);
 
-  // Lazily load the drill-in reports while the detail pane is open.
+  // Lazily load the drill-in reports (ports/git/network/storage) for whatever
+  // app the Apps summary pane or a per-app view is showing. Uncached fetches
+  // are debounced a beat so holding ↓ through the list doesn't fire a report
+  // sweep per row.
+  const wantDetail = currentView.key === 'apps' || currentView.perApp;
   useEffect(() => {
-    if (!detailOpen || !currentApp) return;
+    if (!wantDetail || !currentApp) return;
     const entry = detailCache[currentApp.name];
     if (entry && entry.v === dataV) return;
     let cancelled = false;
     if (!entry) setDetailLoading(true);
-    void loadAppDetail(currentApp.name, source).then((d) => {
-      if (cancelled) return;
-      setDetailCache((c) => ({ ...c, [currentApp.name]: { detail: d, v: dataV } }));
-      setDetailLoading(false);
-    });
+    const t = setTimeout(() => {
+      void loadAppDetail(currentApp.name, source).then((d) => {
+        if (cancelled) return;
+        setDetailCache((c) => ({ ...c, [currentApp.name]: { detail: d, v: dataV } }));
+        setDetailLoading(false);
+      });
+    }, entry ? 0 : 200);
     return () => {
       cancelled = true;
+      clearTimeout(t);
     };
-  }, [detailOpen, currentApp, source, detailCache, dataV]);
+  }, [wantDetail, currentApp, source, detailCache, dataV]);
 
   // Layout sizing. Boxes get explicit widths that sum to `columns` so nothing
   // overflows; `colBudget` is the usable text width inside the content pane
   // (minus borders, padding and a safety margin so lines never soft-wrap).
-  const menuW = 24;
-  const selW = 20;
-  const contentW = Math.max(30, columns - menuW - (currentView.perApp ? selW : 0));
-  const colBudget = Math.max(20, contentW - 5);
-  const viewport = Math.max(3, rows - 7);
+  // The app selector grows to fit the longest app name instead of truncating.
+  const longestApp = allApps.reduce((m, a) => Math.max(m, a.name.length), 0);
+  const selW = Math.min(34, Math.max(18, longestApp + 8));
+  const contentW = Math.max(30, columns - (currentView.perApp ? selW : 0));
+  const colBudget = Math.max(20, contentW - 7);
+  const viewport = Math.max(3, rows - 8); // header + tab bar + borders + title + footer
 
   const clampScroll = useCallback((delta: number, total: number) => {
     setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - viewport)));
@@ -1339,39 +1465,6 @@ export default function App(): ReactNode {
       return;
     }
 
-    // App detail drill-in: browse other apps without leaving it.
-    if (detailOpen) {
-      if (key.escape || input === 'q' || key.backspace || key.delete) {
-        setDetailOpen(false);
-        return;
-      }
-      const left = key.leftArrow || input === 'h';
-      const right = key.rightArrow || input === 'l';
-      if (left || right || key.upArrow || key.downArrow || input === 'j' || input === 'k') {
-        const fwd = right || key.downArrow || input === 'j';
-        setSelectedApp((i) => Math.min(Math.max(0, i + (fwd ? 1 : -1)), apps.length - 1));
-        return;
-      }
-      if (input === ':') {
-        setCmdInput('');
-        return;
-      }
-      if (input === '?') {
-        setHelpOpen(true);
-        return;
-      }
-      if (input === 'r') {
-        void refresh('full');
-        return;
-      }
-      if (quickAction(input)) return;
-      if (input >= '1' && input <= String(VIEWS.length)) {
-        setDetailOpen(false);
-        setView(Number(input) - 1);
-      }
-      return;
-    }
-
     if (input === 'q') {
       exit();
       return;
@@ -1393,7 +1486,7 @@ export default function App(): ReactNode {
       return;
     }
     if (key.tab) {
-      setFocus((f) => (f === 'menu' ? 'content' : 'menu'));
+      setView((v) => (v + (key.shift ? -1 : 1) + VIEWS.length) % VIEWS.length);
       return;
     }
     if (input === 'r') {
@@ -1418,10 +1511,6 @@ export default function App(): ReactNode {
           const cmd = cheatToCommand(line.cmd);
           if (cmd) setCmdInput(cmd);
         }
-        return;
-      }
-      if ((currentView.key === 'apps' || currentView.perApp) && currentApp) {
-        setDetailOpen(true);
       }
       return;
     }
@@ -1441,11 +1530,6 @@ export default function App(): ReactNode {
     if (!up && !down) return;
     const delta = up ? -1 : 1;
 
-    if (focus === 'menu') {
-      setView((v) => (v + delta + VIEWS.length) % VIEWS.length);
-      return;
-    }
-    // focus === 'content'
     if (currentView.key === 'apps') {
       setSelectedApp((i) => Math.min(Math.max(0, i + delta), apps.length - 1));
       return;
@@ -1492,16 +1576,28 @@ export default function App(): ReactNode {
     );
   }
 
+  const currentDetail = currentApp ? detailCache[currentApp.name]?.detail : undefined;
   let content: ReactNode = null;
   switch (currentView.key) {
     case 'apps':
-      content = <AppsView apps={apps} stats={statsMap} selected={selectedApp} focused={focus === 'content'} viewport={viewport} />;
+      content = (
+        <AppsView
+          apps={apps}
+          stats={statsMap}
+          selected={selectedApp}
+          viewport={viewport}
+          width={colBudget}
+          detail={currentDetail}
+          detailLoading={detailLoading}
+          services={services ? services.list : null}
+        />
+      );
       break;
     case 'domains':
-      content = <DomainsView app={currentApp} />;
+      content = <DomainsView app={currentApp} detail={currentDetail} stats={statsMap} width={colBudget} />;
       break;
     case 'process':
-      content = <ProcessView app={currentApp} stats={statsMap} />;
+      content = <ProcessView app={currentApp} stats={statsMap} detail={currentDetail} />;
       break;
     case 'config':
       content = (
@@ -1524,7 +1620,6 @@ export default function App(): ReactNode {
           services={services?.list ?? null}
           loading={servicesLoading}
           cursor={svcCursor}
-          focused={focus === 'content'}
           reveal={svcReveal}
           viewport={viewport}
         />
@@ -1536,7 +1631,6 @@ export default function App(): ReactNode {
           width={colBudget}
           viewport={viewport}
           cursor={cheatCursor}
-          focused={focus === 'content'}
           filter={cheatFilterLive}
         />
       );
@@ -1544,18 +1638,6 @@ export default function App(): ReactNode {
   }
   // Overlays take over the content pane until dismissed.
   let paneTitle = currentView.label.toUpperCase();
-  if (detailOpen) {
-    paneTitle = 'APP DETAIL';
-    content = (
-      <DetailView
-        app={currentApp}
-        detail={currentApp ? detailCache[currentApp.name]?.detail : undefined}
-        loading={detailLoading}
-        services={services ? services.list : null}
-        stats={statsMap}
-      />
-    );
-  }
   if (helpOpen) {
     paneTitle = 'HELP';
     content = <HelpView />;
@@ -1586,18 +1668,18 @@ export default function App(): ReactNode {
         refreshing={refreshing && !loading}
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
+      <TabBar view={view} columns={columns} />
       <Box flexGrow={1}>
-        <Menu view={view} focused={focus === 'menu'} />
         {currentView.perApp ? (
-          <AppSelector apps={apps} selected={selectedApp} focused={focus === 'content'} height={viewport} filter={appFilterLive} />
+          <AppSelector apps={apps} selected={selectedApp} height={viewport} filter={appFilterLive} width={selW} />
         ) : null}
         <Box
           width={contentW}
           flexShrink={0}
           flexDirection="column"
           borderStyle="round"
-          borderColor={focus === 'content' && !currentView.perApp ? theme.accent : theme.dim}
-          paddingX={1}
+          borderColor={theme.dim}
+          paddingX={2}
         >
           <Text wrap="truncate-end" color={theme.dim}>
             {paneTitle}
@@ -1611,7 +1693,7 @@ export default function App(): ReactNode {
       ) : filterInput !== null ? (
         <FilterBar text={filterInput} target={filterTarget === 'cheat' ? 'cheat sheet' : 'apps'} />
       ) : (
-        <Footer view={view} focused={focus} />
+        <Footer view={view} columns={columns} />
       )}
     </Box>
   );

@@ -604,7 +604,7 @@ export function buildAppDetail(
   const storage: string[] = [];
   for (const line of storageOut.split("\n")) {
     const t = line.trim();
-    if (!t || t.startsWith("=====>") || t.startsWith("!")) continue;
+    if (!t || t.startsWith("=====>") || t.startsWith("----->") || t.startsWith("!")) continue;
     if (t.includes(":")) storage.push(t);
   }
   return {

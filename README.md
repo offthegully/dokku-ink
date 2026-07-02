@@ -1,6 +1,6 @@
 # dokku-dash
 
-A terminal dashboard and command cheat sheet for [Dokku](https://dokku.com/), built with [Ink](https://github.com/vadimdemedes/ink) and TypeScript. It runs **directly on your Dokku host** and gives you a Claude-Code-style TUI to see your apps, domains, SSL, processes and config at a glance — no web front-end to host, no service to expose.
+A terminal dashboard and command cheat sheet for [Dokku](https://dokku.com/), built with [Ink](https://github.com/vadimdemedes/ink) and TypeScript. It runs **directly on your Dokku host** (or against one over SSH with `--ssh`) and gives you a Claude-Code-style TUI to see your apps, domains, SSL, processes, CPU/memory usage, config and datastore services at a glance — no web front-end to host, no service to expose.
 
 The dashboard views are **read-only** — they only observe. Anything that changes state goes through the explicit `:` command line (see below), so nothing mutates your server unless you typed it.
 
@@ -54,10 +54,35 @@ dokku-dash
 ## Usage
 
 ```bash
-dokku-dash            # live dashboard (reads the local dokku CLI)
-dokku-dash --demo     # sample data, no Dokku required
+dokku-dash                      # live dashboard (reads the local dokku CLI)
+dokku-dash --ssh dokku@my-host  # remote dashboard over SSH (see below)
+dokku-dash --demo               # sample data, no Dokku required
 dokku-dash --help
 ```
+
+## Remote mode (SSH)
+
+You don't have to run it on the server. Point it at a host with `--ssh <dest>`
+(or `DOKKU_DASH_SSH=<dest>`) and every dokku invocation is executed remotely
+over a multiplexed SSH connection (one handshake, reused for all commands):
+
+```bash
+dokku-dash --ssh dokku@my-host   # uses Dokku's own SSH user
+dokku-dash --ssh ubuntu@my-host  # any user that can run `dokku` (and docker)
+```
+
+Two flavours, one trade-off:
+
+- **`dokku@host`** — Dokku's restricted SSH user. Zero setup if your key is
+  already authorized for deploys. Only dokku commands are possible, so the
+  CPU/MEM columns and the header disk readout show `—`.
+- **any other user** — commands run through a login shell, so `docker stats`
+  and `df` work too and you get full metrics. The user needs access to the
+  docker daemon (typically membership in the `docker` group).
+
+Keys only (`BatchMode=yes`) — if the connection needs a password it fails fast
+rather than hanging the UI. `--doctor` prints which target is active and
+whether docker metrics are available.
 
 ## Running with Bun
 
@@ -84,23 +109,39 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 
 | Key            | Action                                        |
 | -------------- | --------------------------------------------- |
-| `1`–`6`        | Jump to a view                                |
+| `1`–`7`        | Jump to a view                                |
 | `↑` / `↓` (`j`/`k`) | Move within the focused pane (scrollback in Logs) |
 | `←` / `→` (`h`/`l`) | Switch app (in per-app views)            |
+| `enter`        | Open the app detail drill-in; on the cheat sheet, insert the command into `:` |
+| `esc`          | Close detail/help, cancel a prompt, kill a running command |
 | `tab`          | Toggle focus between the menu and the list    |
-| `s`            | Reveal / hide values (Config view)            |
+| `/`            | Filter the app list (or the cheat sheet); `esc` clears |
+| `s`            | Reveal / hide secrets (Config values, service DSN) |
+| `R` / `S` / `B`| Prefill restart / stop / rebuild for the selected app (never auto-runs) |
 | `:`            | Open the command line (run any dokku command) |
 | `r`            | Refresh data from Dokku                       |
+| `?`            | Help overlay                                  |
 | `q` / `Ctrl-C` | Quit                                          |
 
 ### Views
 
-- **Apps** — every app with run status, process types × scale, SSL summary and primary domain.
+- **Apps** — every app with run status, process types × scale, live CPU/MEM usage (from `docker stats`), SSL summary and primary domain. `enter` drills into the selected app.
 - **Domains & SSL** — per-app vhosts, routing enabled/disabled, and certificate issuer + expiry (highlighted when expiring within 14 days).
-- **Processes** — per-process scale and individual container statuses, plus restart policy.
+- **Processes** — per-process scale and individual container statuses with per-container CPU/memory, plus restart policy.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
 - **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `↑`/`↓` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
-- **Cheat Sheet** — a scrollable reference of the most useful `dokku` commands, grouped by area.
+- **Services** — datastore services from the official plugin family (postgres, redis, mysql, mongo, …): status, version, and which apps each service is linked to. The selected service's DSN is masked until you press `s`.
+- **Cheat Sheet** — a filterable reference of the most useful `dokku` commands, grouped by area. `enter` inserts the selected command into the `:` prompt (with `<app>` pre-substituted as `$app`) so it doubles as a launcher.
+
+### App detail (`enter`)
+
+One pane with everything about the selected app: created date, deploy source,
+restart policy, live CPU/MEM, git branch/SHA/last-deploy (`git:report`), port
+mappings (`ports:report`), persistent storage mounts (`storage:list`), docker
+networks (`network:report`), domains + certificate expiry, and — once the
+Services view has loaded — the datastore services linked to it. `←`/`→` flips
+between apps without leaving the pane; the extra reports are fetched lazily and
+cached until the next full refresh.
 
 ### Running commands
 
@@ -132,19 +173,27 @@ with your Dokku version.
 | Env var             | Default    | Purpose                                  |
 | ------------------- | ---------- | ---------------------------------------- |
 | `DOKKU_DASH_BIN`    | `dokku`    | Path to the `dokku` binary               |
+| `DOKKU_DASH_SSH`    | –          | Remote target, same as `--ssh` (e.g. `dokku@my-host`) |
 | `DOKKU_DASH_HOST`   | hostname   | Label shown in the header                |
 | `DOKKU_DASH_DEMO`   | –          | Set to `1` to force demo data            |
 | `DOKKU_DASH_REFRESH`| `30`       | Auto-refresh interval in seconds (`0` disables) |
 
 ## How it reads data
 
-On launch, on `r`, and every `DOKKU_DASH_REFRESH` seconds (background, no
-spinner) it runs, read-only:
+A **full refresh** (launch, `r`, pushed events, and every 5th poll) runs,
+read-only:
 
 - `dokku apps:list`
 - then, per app (bounded concurrency): `dokku apps:report <app> --format json`, `dokku ps:report <app> --format json`, `dokku domains:report <app> --format json`, `dokku certs:report <app> --format json`
+- plus `docker stats --no-stream` and `df -Pk /` for usage metrics (skipped gracefully when docker isn't reachable)
 
-Config is loaded lazily per app via `dokku config:show <app>` (JSON when available) and silently refetched after each refresh, so the Config view tracks reality too. Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
+The polls in between are **light**: only `ps:report` (the one thing that
+changes minute-to-minute) and `docker stats` re-run; domains/certs/metadata are
+kept from the previous snapshot. That cuts subprocess churn ~75% without
+visible staleness — anything that would change the skipped reports (a deploy, a
+domain change) fires a full refresh through the events watcher anyway.
+
+Config is loaded lazily per app via `dokku config:show <app>` (JSON when available), datastore services via `dokku plugin:list` + `<plugin>:list` + `<plugin>:info`, and the app-detail reports (`ports`, `git`, `network`, `storage:list`) only when you open the drill-in — all silently refetched after each full refresh. Parsing is defensive: missing plugins or older Dokku versions degrade gracefully rather than crashing.
 
 Three things make it feel live rather than polled:
 
@@ -171,6 +220,7 @@ src/
   index.tsx      entry point (shebang + flags + render)
   App.tsx        TUI: layout, navigation, views
   dokku.ts       data layer (dokku CLI -> normalized model) + demo fallback
+  exec.ts        subprocess plumbing: local vs remote (SSH) invocation
   demo.ts        sample data used when dokku is absent
   cheatsheet.ts  curated command reference
   ui.ts          presentation helpers (badges, truncation, windowing)
@@ -180,7 +230,10 @@ test/            parsing + render tests
 
 ## Roadmap ideas
 
-Read-only today by design. Natural next steps: datastore/service views (postgres/redis), one-key actions (restart/rebuild) behind a confirmation, and an optional remote mode via a small API on the host.
+Read-only today by design (mutations only through the explicit `:` prompt).
+Natural next steps: an activity feed from `dokku events -t` (already tailed for
+refresh triggers), nginx access/error log views, `letsencrypt:cron-job` status,
+and a host/system view (plugin versions, global domains, docker disk usage).
 
 ## License
 

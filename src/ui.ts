@@ -43,6 +43,17 @@ export function fmtAge(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h`;
 }
 
+// Compact "how old" for the apps table AGE column: 13d, 3mo, 1.2y.
+export function fmtAgeDays(iso: string | null | undefined): string {
+  const days = daysUntil(iso);
+  if (days === null) return '—';
+  const d = Math.max(0, -days);
+  if (d < 1) return '<1d';
+  if (d < 90) return `${d}d`;
+  if (d < 720) return `${Math.round(d / 30)}mo`;
+  return `${(d / 365).toFixed(1)}y`;
+}
+
 // Compact byte formatting for usage columns: 24M, 1.4G.
 export function fmtBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return '—';
