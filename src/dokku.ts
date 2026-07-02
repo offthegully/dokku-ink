@@ -10,20 +10,32 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { DEMO } from "./demo.js";
+import {
+  dokkuInvocation,
+  hostInvocation,
+  isRemote,
+  remoteLabel,
+  DOKKU_BIN,
+} from "./exec.js";
 import type {
+  AppDetail,
   ConfigResult,
+  ContainerStat,
   DokkuApp,
+  DokkuService,
+  HostDisk,
   Overview,
   ProcInstance,
   Process,
   RawReport,
+  ServicesResult,
   Source,
   Ssl,
+  StatsMap,
+  StatsResult,
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
-
-const DOKKU_BIN = process.env.DOKKU_DASH_BIN || "dokku";
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -35,7 +47,9 @@ export async function hasDokku(): Promise<boolean> {
   if (process.env.DOKKU_DASH_DEMO === "1") return false;
   if (_hasDokku !== null) return _hasDokku;
   try {
-    await execFileAsync(DOKKU_BIN, ["version"], { timeout: 8000 });
+    const inv = dokkuInvocation(["version"]);
+    // SSH cold-start (handshake + auth) can exceed a local-tuned timeout.
+    await execFileAsync(inv.cmd, inv.argv, { timeout: isRemote() ? 15000 : 8000 });
     _hasDokku = true;
   } catch {
     _hasDokku = false;
@@ -44,7 +58,8 @@ export async function hasDokku(): Promise<boolean> {
 }
 
 async function dokku(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync(DOKKU_BIN, args, {
+  const inv = dokkuInvocation(args);
+  const { stdout } = await execFileAsync(inv.cmd, inv.argv, {
     timeout: 20000,
     maxBuffer: 1024 * 1024 * 16,
   });
@@ -58,11 +73,14 @@ interface RawResult {
   error?: string;
 }
 
-// Like dokku() but never throws — captures stdout/stderr/error for diagnostics.
-async function dokkuRaw(args: string[]): Promise<RawResult> {
+async function rawExec(
+  cmd: string,
+  argv: string[],
+  timeout = 20000,
+): Promise<RawResult> {
   try {
-    const { stdout, stderr } = await execFileAsync(DOKKU_BIN, args, {
-      timeout: 20000,
+    const { stdout, stderr } = await execFileAsync(cmd, argv, {
+      timeout,
       maxBuffer: 1024 * 1024 * 16,
     });
     return { ok: true, stdout, stderr };
@@ -75,6 +93,26 @@ async function dokkuRaw(args: string[]): Promise<RawResult> {
       error: err.message ?? String(e),
     };
   }
+}
+
+// Like dokku() but never throws — captures stdout/stderr/error for diagnostics.
+async function dokkuRaw(args: string[]): Promise<RawResult> {
+  const inv = dokkuInvocation(args);
+  return rawExec(inv.cmd, inv.argv);
+}
+
+// Host-level command (docker, df). Resolves to a failed result when the
+// target can't run them (SSH as the restricted dokku user).
+async function hostRaw(command: string[], timeout = 20000): Promise<RawResult> {
+  const inv = hostInvocation(command);
+  if (!inv)
+    return {
+      ok: false,
+      stdout: "",
+      stderr: "",
+      error: "host commands unavailable over dokku@ SSH",
+    };
+  return rawExec(inv.cmd, inv.argv, timeout);
 }
 
 // Parse `dokku apps:list` output into app names, tolerant of the "=====> My Apps"
@@ -288,6 +326,325 @@ export function buildApps(
   });
 }
 
+// Cheap refresh between full ones: only ps:report changes minute-to-minute,
+// so re-fetch just that and graft it onto the previous snapshot. Domains,
+// certs and app metadata only move on deploys/config changes, which trigger
+// a full refresh via the events watcher anyway.
+export async function loadOverviewLight(prev: Overview): Promise<Overview> {
+  if (prev.source !== "dokku" || !(await hasDokku())) return loadOverview();
+  const psRep: Record<string, Record<string, string>> = {};
+  await mapLimit(
+    prev.apps.map((a) => a.name),
+    8,
+    async (name) => {
+      const ps = await reportForApp("ps", name);
+      if (ps) psRep[name] = ps;
+    },
+  );
+  const apps = prev.apps.map((a) => {
+    const ps = psRep[a.name];
+    if (!ps) return a;
+    const runningRaw = pick(ps, "running");
+    return {
+      ...a,
+      running: runningRaw === undefined ? null : toBool(runningRaw),
+      deployed: toBool(pick(ps, "deployed")),
+      restartPolicy:
+        pick(ps, "restart-policy", "computed-restart-policy") || null,
+      processes: parseProcesses(ps),
+    };
+  });
+  return { apps, source: "dokku", warnings: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Container metrics (docker stats) + host disk
+// ---------------------------------------------------------------------------
+
+let _hasDocker: boolean | null = null;
+
+async function hasDocker(): Promise<boolean> {
+  if (_hasDocker !== null) return _hasDocker;
+  const r = await hostRaw(
+    ["docker", "version", "--format", "{{.Server.Version}}"],
+    10000,
+  );
+  _hasDocker = r.ok;
+  return _hasDocker;
+}
+
+// "55.2MiB", "1.9GiB", "512kB" -> bytes. docker stats mixes binary (MiB) and
+// decimal (MB) suffixes depending on version; both are close enough for a
+// dashboard readout.
+export function parseSize(s: string | undefined): number | null {
+  if (!s) return null;
+  const m = /^([\d.]+)\s*([KMGTP]?i?B?)$/i.exec(s.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const unit = m[2].toUpperCase();
+  const exp = unit.startsWith("K")
+    ? 1
+    : unit.startsWith("M")
+      ? 2
+      : unit.startsWith("G")
+        ? 3
+        : unit.startsWith("T")
+          ? 4
+          : unit.startsWith("P")
+            ? 5
+            : 0;
+  const base = unit.includes("I") ? 1024 : 1000;
+  return Math.round(n * base ** exp);
+}
+
+const pctNum = (s: string | undefined): number | null => {
+  if (!s) return null;
+  const n = Number(s.replace("%", "").trim());
+  return Number.isFinite(n) ? n : null;
+};
+
+// Parse `docker stats --no-stream --format {{json .}}` NDJSON output into a
+// map keyed by container name (dokku names containers `<app>.<proc>.<n>`).
+export function parseDockerStats(out: string): StatsMap {
+  const map: StatsMap = {};
+  for (const line of out.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    try {
+      const j = JSON.parse(t) as Record<string, string>;
+      const name = j.Name || j.Container;
+      if (!name) continue;
+      const [used, limit] = String(j.MemUsage || "")
+        .split("/")
+        .map((s) => s.trim());
+      const stat: ContainerStat = {
+        name,
+        cpuPct: pctNum(j.CPUPerc),
+        memBytes: parseSize(used),
+        memLimitBytes: parseSize(limit),
+      };
+      map[name] = stat;
+    } catch {
+      /* skip malformed line */
+    }
+  }
+  return map;
+}
+
+// Parse POSIX `df -Pk /` output (sizes in 1K blocks).
+export function parseDf(out: string): HostDisk | null {
+  const lines = out.trim().split("\n");
+  if (lines.length < 2) return null;
+  const cols = lines[1].trim().split(/\s+/);
+  if (cols.length < 5) return null;
+  const totalK = Number(cols[1]);
+  const usedK = Number(cols[2]);
+  const pct = Number(cols[4].replace("%", ""));
+  if (!Number.isFinite(totalK) || !Number.isFinite(usedK)) return null;
+  return {
+    usedPct: Number.isFinite(pct)
+      ? pct
+      : Math.round((usedK / Math.max(1, totalK)) * 100),
+    usedBytes: usedK * 1024,
+    totalBytes: totalK * 1024,
+  };
+}
+
+// Snapshot per-container CPU/memory plus root-disk usage. Returns stats:null
+// when docker isn't reachable (dashboard renders "—" instead of numbers).
+export async function loadStats(): Promise<StatsResult> {
+  if (!(await hasDokku())) {
+    return {
+      stats: structuredClone(DEMO.stats),
+      disk: { ...DEMO.disk },
+      source: "demo",
+    };
+  }
+  if (!(await hasDocker())) return { stats: null, disk: null, source: "dokku" };
+  const [statsRes, dfRes] = await Promise.all([
+    // --no-stream still waits out one sampling interval (~2s); give it room.
+    hostRaw(
+      ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+      30000,
+    ),
+    hostRaw(["df", "-Pk", "/"], 10000),
+  ]);
+  return {
+    stats: statsRes.ok ? parseDockerStats(statsRes.stdout) : null,
+    disk: dfRes.ok ? parseDf(dfRes.stdout) : null,
+    source: "dokku",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Datastore services (official plugin family: postgres, redis, mysql, …)
+// ---------------------------------------------------------------------------
+
+// The official dokku datastore plugins all share the list/info CLI shape.
+const DATASTORE_PLUGINS = [
+  "postgres",
+  "mysql",
+  "mariadb",
+  "mongo",
+  "redis",
+  "memcached",
+  "rabbitmq",
+  "elasticsearch",
+  "couchdb",
+  "clickhouse",
+  "meilisearch",
+  "nats",
+  "solr",
+  "typesense",
+];
+
+// Installed+enabled datastore plugins from `dokku plugin:list` output, whose
+// lines look like: "  postgres             1.38.0 enabled    dokku postgres service plugin".
+export function parseDatastorePlugins(out: string): string[] {
+  const found: string[] = [];
+  for (const line of out.split("\n")) {
+    const t = line.trim();
+    const name = t.split(/\s+/)[0];
+    if (name && DATASTORE_PLUGINS.includes(name) && /\benabled\b/.test(t)) {
+      found.push(name);
+    }
+  }
+  return found;
+}
+
+let _plugins: string[] | null = null;
+
+async function datastorePlugins(): Promise<string[]> {
+  if (_plugins !== null) return _plugins;
+  const r = await dokkuRaw(["plugin:list"]);
+  _plugins = r.ok ? parseDatastorePlugins(r.stdout) : [];
+  return _plugins;
+}
+
+// Service names from `dokku <plugin>:list` — tolerate the "=====>" banner and
+// the NAME/VERSION/... column header row.
+export function parseServiceList(out: string): string[] {
+  const names: string[] = [];
+  for (const line of out.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("=====>") || t.startsWith("!")) continue;
+    const tok = t.split(/\s+/)[0];
+    if (!tok || tok === "NAME") continue;
+    names.push(tok);
+  }
+  return names;
+}
+
+// `dokku <plugin>:info <svc>` prints indented "Key: value" rows. Lowercased
+// key -> value map; empty values dropped.
+export function parseServiceInfo(out: string): Record<string, string> {
+  const kv: Record<string, string> = {};
+  for (const line of out.split("\n")) {
+    const m = /^\s+([A-Za-z][A-Za-z0-9 -]*?):\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const val = m[2].trim();
+    if (val && val !== "-") kv[m[1].trim().toLowerCase()] = val;
+  }
+  return kv;
+}
+
+export async function loadServices(): Promise<ServicesResult> {
+  if (!(await hasDokku())) {
+    return {
+      services: structuredClone(DEMO.services),
+      plugins: ["postgres", "redis"],
+      source: "demo",
+    };
+  }
+  const plugins = await datastorePlugins();
+  const services: DokkuService[] = [];
+  const targets: Array<{ plugin: string; name: string }> = [];
+  for (const plugin of plugins) {
+    const r = await dokkuRaw([`${plugin}:list`]);
+    if (!r.ok) continue; // "There are no <X> services" exits non-zero
+    for (const name of parseServiceList(r.stdout))
+      targets.push({ plugin, name });
+  }
+  await mapLimit(targets, 4, async ({ plugin, name }) => {
+    const r = await dokkuRaw([`${plugin}:info`, name]);
+    const kv = r.ok ? parseServiceInfo(r.stdout) : {};
+    services.push({
+      plugin,
+      name,
+      status: kv["status"] ?? null,
+      version: kv["version"] ?? null,
+      links: splitHosts(kv["links"]),
+      exposedPorts: kv["exposed ports"] ?? null,
+      dsn: kv["dsn"] ?? null,
+    });
+  });
+  services.sort(
+    (a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name),
+  );
+  return { services, plugins, source: "dokku" };
+}
+
+// ---------------------------------------------------------------------------
+// Per-app drill-in detail (ports, storage, git, network)
+// ---------------------------------------------------------------------------
+
+// Pure assembly from raw report objects — exported for tests. Report JSON
+// keys vary across dokku versions between plugin-prefixed and bare names, so
+// pick() both.
+export function buildAppDetail(
+  ports: Record<string, string> | undefined,
+  git: Record<string, string> | undefined,
+  network: Record<string, string> | undefined,
+  storageOut: string,
+): AppDetail {
+  const portList = splitHosts(
+    pick(ports, "map", "ports-map") ?? pick(ports, "map-detected", "ports-map-detected"),
+  );
+  const storage: string[] = [];
+  for (const line of storageOut.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("=====>") || t.startsWith("!")) continue;
+    if (t.includes(":")) storage.push(t);
+  }
+  return {
+    ports: portList,
+    storage,
+    git: {
+      branch: pick(git, "deploy-branch", "git-deploy-branch") ?? null,
+      sha: pick(git, "sha", "git-sha") ?? null,
+      lastUpdated:
+        pick(git, "last-updated-at", "git-last-updated-at") ?? null,
+      sourceImage: pick(git, "source-image", "git-source-image") ?? null,
+    },
+    network: {
+      initial: pick(network, "initial-network", "network-initial-network") ?? null,
+      attachPostCreate:
+        pick(network, "attach-post-create", "network-attach-post-create") ?? null,
+      attachPostDeploy:
+        pick(network, "attach-post-deploy", "network-attach-post-deploy") ?? null,
+    },
+  };
+}
+
+export async function loadAppDetail(
+  appName: string,
+  source: Source,
+): Promise<AppDetail> {
+  if (source === "demo" || !(await hasDokku())) {
+    return structuredClone(
+      DEMO.details[appName] ?? buildAppDetail(undefined, undefined, undefined, ""),
+    );
+  }
+  const [ports, git, network, storage] = await Promise.all([
+    reportForApp("ports", appName),
+    reportForApp("git", appName),
+    reportForApp("network", appName),
+    dokkuRaw(["storage:list", appName]),
+  ]);
+  return buildAppDetail(ports, git, network, storage.ok ? storage.stdout : "");
+}
+
 // Per-app environment variables.
 export async function loadConfig(
   appName: string,
@@ -386,7 +743,8 @@ export function tailLogs(
     return () => clearInterval(t);
   }
 
-  const child = spawn(DOKKU_BIN, ["logs", app, "-t", "-n", "100"], {
+  const inv = dokkuInvocation(["logs", app, "-t", "-n", "100"]);
+  const child = spawn(inv.cmd, inv.argv, {
     stdio: ["ignore", "pipe", "pipe"],
   });
   streamLines(child.stdout, false, onLine);
@@ -415,7 +773,8 @@ export function runCommand(
   onLine: LogSink,
   onEnd: (msg: string, ok: boolean) => void,
 ): () => void {
-  const child = spawn(DOKKU_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const inv = dokkuInvocation(args);
+  const child = spawn(inv.cmd, inv.argv, { stdio: ["ignore", "pipe", "pipe"] });
   streamLines(child.stdout, false, onLine);
   streamLines(child.stderr, true, onLine);
 
@@ -448,7 +807,8 @@ export function watchEvents(
   onEvent: (line: string) => void,
   onUnavailable?: () => void,
 ): () => void {
-  const child = spawn(DOKKU_BIN, ["events", "-t"], {
+  const inv = dokkuInvocation(["events", "-t"]);
+  const child = spawn(inv.cmd, inv.argv, {
     stdio: ["ignore", "pipe", "ignore"],
   });
   let stopped = false;
@@ -491,7 +851,12 @@ const clip = (s: string, n = 500) =>
 export async function runDoctor(): Promise<string> {
   const L: string[] = [];
   L.push("dokku-dash doctor");
-  L.push(`binary: ${DOKKU_BIN}   (override with DOKKU_DASH_BIN)`);
+  L.push(`binary: ${DOKKU_BIN()}   (override with DOKKU_DASH_BIN)`);
+  L.push(
+    isRemote()
+      ? `target: ssh ${remoteLabel()}   (from DOKKU_DASH_SSH / --ssh)`
+      : "target: local",
+  );
   L.push("");
 
   const v = await dokkuRaw(["version"]);
@@ -553,6 +918,37 @@ export async function runDoctor(): Promise<string> {
   }
 
   if (ov.source === "dokku") {
+    const stats = await loadStats();
+    L.push(
+      `# docker stats  ->  ${
+        stats.stats
+          ? `OK — ${Object.keys(stats.stats).length} container(s) sampled`
+          : "unavailable — CPU/MEM columns will show “—”" +
+            (isRemote() ? " (host commands need a non-dokku SSH user)" : "")
+      }`,
+    );
+    if (stats.disk) L.push(`  root disk: ${stats.disk.usedPct}% used`);
+    L.push("");
+
+    const plugins = await datastorePlugins();
+    L.push(
+      `# datastore plugins  ->  ${plugins.length ? plugins.join(", ") : "(none detected via plugin:list)"}`,
+    );
+    if (plugins.length) {
+      const svcs = await loadServices();
+      L.push(
+        indent(
+          svcs.services
+            .map(
+              (s) =>
+                `${s.plugin}/${s.name}  status=${s.status ?? "?"}  links=${s.links.join(",") || "-"}`,
+            )
+            .join("\n") || "(no services)",
+        ),
+      );
+    }
+    L.push("");
+
     const ev = await dokkuRaw(["events"]);
     L.push(
       `# dokku events  ->  ${ev.ok ? "OK — event-driven refresh active" : "unavailable — run `dokku events:on` for push refresh (polling still works)"}`,

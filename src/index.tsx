@@ -19,6 +19,17 @@ if (args.includes('--version') || args.includes('-v')) {
   console.log(`dokku-dash ${version}`);
   process.exit(0);
 }
+// --ssh <dest> must land in the env before the first dokku call (the exec
+// layer resolves its target lazily, so setting it here is early enough).
+const sshIdx = args.indexOf('--ssh');
+if (sshIdx !== -1) {
+  const dest = args[sshIdx + 1];
+  if (!dest || dest.startsWith('-')) {
+    console.error('--ssh needs a destination, e.g. --ssh dokku@my-host');
+    process.exit(1);
+  }
+  process.env.DOKKU_DASH_SSH = dest;
+}
 if (args.includes('--doctor') || args.includes('doctor')) {
   const { runDoctor } = await import('./dokku.js');
   console.log(await runDoctor());
@@ -46,27 +57,34 @@ USAGE
 
 OPTIONS
   --demo         Show demo data (no Dokku required)
+  --ssh <dest>   Run against a remote host over SSH (e.g. dokku@my-host);
+                 use a non-dokku user to also get docker CPU/MEM metrics
   --doctor       Probe the dokku CLI and print diagnostics (no TUI)
   -h, --help     Show this help
   -v, --version  Show version
 
 KEYS (inside the dashboard)
-  1-6            Jump to a view
+  1-7            Jump to a view
   ↑ / ↓ (j/k)    Move within the focused pane (scrollback in Logs)
   ← / → (h/l)    Switch app (in per-app views)
+  enter          Open the app detail drill-in; insert a cheat-sheet command
   tab            Toggle focus between the menu and the list/content
-  s              Reveal / hide values (Config view)
+  /              Filter the app list (or the cheat sheet); esc clears
+  s              Reveal / hide secrets (Config values, service DSN)
+  R / S / B      Prefill restart / stop / rebuild for the selected app
   :              Open the command line (run any dokku command;
                  $app expands to the selected app, esc cancels/kills)
   r              Refresh data from Dokku
+  ?              Help overlay
   q / Ctrl-C     Quit
 
 ENV
   DOKKU_DASH_BIN      Path to the dokku binary (default: dokku)
+  DOKKU_DASH_SSH      Remote target, same as --ssh (e.g. dokku@my-host)
   DOKKU_DASH_HOST     Label shown in the header (default: hostname)
   DOKKU_DASH_DEMO     Set to 1 to force demo data
   DOKKU_DASH_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
 
-Run this directly on your Dokku host; it shells out to the local
-\`dokku\` CLI (read-only) — no REST API or extra services needed.`);
+Run this on your Dokku host (or point --ssh at one); it shells out to
+the \`dokku\` CLI (read-only) — no REST API or extra services needed.`);
 }

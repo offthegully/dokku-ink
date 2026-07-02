@@ -3,8 +3,28 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildApps, toBool } from '../src/dokku.js';
-import { fmtAge, sslBadge, runningBadge, soonestCert, leadingTimestamp } from '../src/ui.js';
+import {
+  buildApps,
+  buildAppDetail,
+  parseDatastorePlugins,
+  parseDf,
+  parseDockerStats,
+  parseServiceInfo,
+  parseServiceList,
+  parseSize,
+  toBool,
+} from '../src/dokku.js';
+import {
+  appUsage,
+  fmtAge,
+  fmtBytes,
+  fmtDate,
+  fmtPct,
+  sslBadge,
+  runningBadge,
+  soonestCert,
+  leadingTimestamp,
+} from '../src/ui.js';
 import type { RawReport } from '../src/types.js';
 
 // Sample shaped like real `dokku <plugin>:report --format json` output
@@ -139,6 +159,136 @@ test('leadingTimestamp extracts and orders docker -t timestamps', () => {
   assert.equal(a, '2026-07-01T18:22:29.599983966Z');
   assert.ok(a! < b!); // lexicographic order == chronological order
   assert.equal(leadingTimestamp('log stream ended (exit 1)'), null);
+});
+
+test('parseSize handles docker stats units', () => {
+  assert.equal(parseSize('55.2MiB'), Math.round(55.2 * 1024 * 1024));
+  assert.equal(parseSize('1.9GiB'), Math.round(1.9 * 1024 ** 3));
+  assert.equal(parseSize('512kB'), 512_000);
+  assert.equal(parseSize('0B'), 0);
+  assert.equal(parseSize('garbage'), null);
+  assert.equal(parseSize(undefined), null);
+});
+
+test('parseDockerStats maps NDJSON samples by container name', () => {
+  const out = [
+    '{"Name":"blog.web.1","CPUPerc":"0.42%","MemUsage":"182MiB / 2GiB","MemPerc":"8.9%"}',
+    '{"Name":"api.web.2","CPUPerc":"5.20%","MemUsage":"298MiB / 2GiB"}',
+    'not json at all',
+    '{"Container":"legacy-key","CPUPerc":"1%","MemUsage":"10MiB / 1GiB"}',
+  ].join('\n');
+  const map = parseDockerStats(out);
+  assert.equal(map['blog.web.1'].cpuPct, 0.42);
+  assert.equal(map['blog.web.1'].memBytes, 182 * 1024 * 1024);
+  assert.equal(map['blog.web.1'].memLimitBytes, 2 * 1024 ** 3);
+  assert.equal(map['api.web.2'].cpuPct, 5.2);
+  assert.ok(map['legacy-key']); // falls back to the Container field
+  assert.equal(Object.keys(map).length, 3);
+});
+
+test('appUsage sums container samples for an app', () => {
+  const apps = buildApps(['blog'], appsRep, psRep, domRep, certRep);
+  const stats = parseDockerStats(
+    [
+      '{"Name":"blog.web.1","CPUPerc":"0.4%","MemUsage":"100MiB / 2GiB"}',
+      '{"Name":"blog.web.2","CPUPerc":"0.6%","MemUsage":"100MiB / 2GiB"}',
+      '{"Name":"other.web.1","CPUPerc":"99%","MemUsage":"1GiB / 2GiB"}',
+    ].join('\n'),
+  );
+  const u = appUsage(apps[0], stats);
+  assert.equal(u.cpu, 1.0);
+  assert.equal(u.mem, 200 * 1024 * 1024); // worker.1 has no sample; ignored
+  assert.deepEqual(appUsage(apps[0], null), { cpu: null, mem: null });
+});
+
+test('parseDf reads POSIX df -Pk output', () => {
+  const d = parseDf(
+    'Filesystem     1024-blocks     Used Available Capacity Mounted on\n' +
+      '/dev/vda1         50331648 30838784  19492864      62% /\n',
+  );
+  assert.equal(d?.usedPct, 62);
+  assert.equal(d?.totalBytes, 50331648 * 1024);
+  assert.equal(parseDf('garbage'), null);
+});
+
+test('fmtBytes and fmtPct format compactly', () => {
+  assert.equal(fmtBytes(24 * 1024 * 1024), '24M');
+  assert.equal(fmtBytes(1.4 * 1024 ** 3), '1.4G');
+  assert.equal(fmtBytes(null), '—');
+  assert.equal(fmtPct(0.42), '0.4%');
+  assert.equal(fmtPct(11.3), '11%');
+  assert.equal(fmtPct(null), '—');
+});
+
+test('fmtDate accepts ISO strings and epoch seconds', () => {
+  assert.equal(fmtDate('2026-06-28T21:14:00Z'), '2026-06-28');
+  assert.equal(fmtDate('1730556060'), '2024-11-02'); // dokku created-at shape
+  assert.equal(fmtDate(null), '—');
+});
+
+test('parseDatastorePlugins finds enabled datastore plugins', () => {
+  const out = [
+    '  00_dokku-standard    0.38.0 enabled    dokku core standard plugin',
+    '  postgres             1.38.0 enabled    dokku postgres service plugin',
+    '  redis                1.36.5 disabled   dokku redis service plugin',
+    '  letsencrypt          0.22.0 enabled    Automated installation of let\'s encrypt certs',
+  ].join('\n');
+  assert.deepEqual(parseDatastorePlugins(out), ['postgres']);
+});
+
+test('parseServiceList skips banners and column headers', () => {
+  const out =
+    '=====> Postgres services\n' +
+    'NAME     VERSION              STATUS    EXPOSED PORTS    LINKS\n' +
+    'blog-db  postgres:16.2        running   -                blog\n' +
+    'api-db   postgres:16.2        running   -                api\n';
+  assert.deepEqual(parseServiceList(out), ['blog-db', 'api-db']);
+});
+
+test('parseServiceInfo extracts indented key/value rows', () => {
+  const out =
+    '=====> blog-db postgres service information\n' +
+    '       Config dir:          /var/lib/dokku/services/postgres/blog-db/config\n' +
+    '       Dsn:                 postgres://postgres:pw@dokku-postgres-blog-db:5432/blog_db\n' +
+    '       Exposed ports:       -\n' +
+    '       Links:               blog api\n' +
+    '       Status:              running\n' +
+    '       Version:             postgres:16.2\n';
+  const kv = parseServiceInfo(out);
+  assert.equal(kv['status'], 'running');
+  assert.equal(kv['version'], 'postgres:16.2');
+  assert.equal(kv['links'], 'blog api');
+  assert.equal(kv['exposed ports'], undefined); // "-" means unset
+  assert.match(kv['dsn'], /^postgres:\/\//);
+});
+
+test('buildAppDetail assembles drill-in reports (both key shapes)', () => {
+  const d = buildAppDetail(
+    { map: 'http:80:5000 https:443:5000' },
+    { 'deploy-branch': 'main', sha: 'abc1234def', 'last-updated-at': '1751100840' },
+    { 'initial-network': 'bridge', 'attach-post-create': 'internal' },
+    '=====> blog storage volume mounts:\n' +
+      '       /var/lib/dokku/data/storage/blog:/app/uploads\n',
+  );
+  assert.deepEqual(d.ports, ['http:80:5000', 'https:443:5000']);
+  assert.deepEqual(d.storage, ['/var/lib/dokku/data/storage/blog:/app/uploads']);
+  assert.equal(d.git.branch, 'main');
+  assert.equal(d.git.sha, 'abc1234def');
+  assert.equal(d.network.initial, 'bridge');
+  assert.equal(d.network.attachPostCreate, 'internal');
+
+  // Older plugin-prefixed keys and empty inputs.
+  const d2 = buildAppDetail(
+    { 'ports-map': 'http:80:3000' },
+    { 'git-deploy-branch': 'develop', 'git-sha': 'ffff' },
+    undefined,
+    '',
+  );
+  assert.deepEqual(d2.ports, ['http:80:3000']);
+  assert.equal(d2.git.branch, 'develop');
+  const empty = buildAppDetail(undefined, undefined, undefined, '');
+  assert.deepEqual(empty.ports, []);
+  assert.equal(empty.git.sha, null);
 });
 
 test('soonestCert picks the certificate expiring first', () => {

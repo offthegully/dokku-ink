@@ -1,6 +1,6 @@
 // Shared presentation utilities used across views.
 
-import type { DokkuApp, Ssl } from './types.js';
+import type { DokkuApp, Ssl, StatsMap } from './types.js';
 
 export const theme = {
   accent: 'cyan',
@@ -27,10 +27,12 @@ export function padEnd(str: unknown, n: number): string {
   return truncate(str, n).padEnd(n);
 }
 
+// Accepts ISO strings and dokku's epoch-seconds report values ("1730556060").
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return String(iso);
+  const s = String(iso).trim();
+  const d = /^\d{9,12}$/.test(s) ? new Date(Number(s) * 1000) : new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
   return d.toISOString().slice(0, 10);
 }
 
@@ -39,6 +41,45 @@ export function fmtAge(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h`;
+}
+
+// Compact byte formatting for usage columns: 24M, 1.4G.
+export function fmtBytes(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  if (n < 1024) return `${Math.round(n)}B`;
+  const units = ['K', 'M', 'G', 'T'];
+  let v = n;
+  let u = -1;
+  do {
+    v /= 1024;
+    u++;
+  } while (v >= 1024 && u < units.length - 1);
+  return `${v >= 10 ? Math.round(v) : v.toFixed(1)}${units[u]}`;
+}
+
+export function fmtPct(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  return `${n >= 10 ? Math.round(n) : n.toFixed(1)}%`;
+}
+
+// Sum a docker-stats snapshot across an app's containers (named
+// `<app>.<proc>.<n>`). null = no sample for any container.
+export function appUsage(
+  app: DokkuApp,
+  stats: StatsMap | null | undefined,
+): { cpu: number | null; mem: number | null } {
+  if (!stats) return { cpu: null, mem: null };
+  let cpu: number | null = null;
+  let mem: number | null = null;
+  for (const p of app.processes) {
+    for (const inst of p.instances) {
+      const s = stats[`${app.name}.${p.type}.${inst.index}`];
+      if (!s) continue;
+      if (s.cpuPct !== null) cpu = (cpu ?? 0) + s.cpuPct;
+      if (s.memBytes !== null) mem = (mem ?? 0) + s.memBytes;
+    }
+  }
+  return { cpu, mem };
 }
 
 export function daysUntil(iso: string | null | undefined): number | null {

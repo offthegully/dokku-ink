@@ -8,7 +8,10 @@ import {
   truncate,
   padEnd,
   fmtAge,
+  fmtBytes,
   fmtDate,
+  fmtPct,
+  appUsage,
   daysUntil,
   leadingTimestamp,
   runningBadge,
@@ -16,12 +19,32 @@ import {
   sslBadge,
   windowed,
 } from './ui.js';
-import { loadOverview, loadConfig, runCommand, tailLogs, watchEvents } from './dokku.js';
+import {
+  loadOverview,
+  loadOverviewLight,
+  loadConfig,
+  loadServices,
+  loadStats,
+  loadAppDetail,
+  runCommand,
+  tailLogs,
+  watchEvents,
+} from './dokku.js';
+import { remoteLabel } from './exec.js';
 import { CHEATSHEET } from './cheatsheet.js';
-import type { DokkuApp, Overview, Source } from './types.js';
+import type {
+  AppDetail,
+  DokkuApp,
+  DokkuService,
+  HostDisk,
+  Overview,
+  Source,
+  StatsMap,
+  StatsResult,
+} from './types.js';
 
 interface ViewDef {
-  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'cheatsheet';
+  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'services' | 'cheatsheet';
   label: string;
   perApp: boolean;
 }
@@ -32,6 +55,7 @@ const VIEWS: ViewDef[] = [
   { key: 'process', label: 'Processes', perApp: true },
   { key: 'config', label: 'Config / Env', perApp: true },
   { key: 'logs', label: 'Logs', perApp: true },
+  { key: 'services', label: 'Services', perApp: false },
   { key: 'cheatsheet', label: 'Cheat Sheet', perApp: false },
 ];
 
@@ -45,6 +69,9 @@ const REFRESH_SECONDS = (() => {
 // Processes view is open, poll on a tighter leash (never slower than the
 // configured cadence, never faster than 10s).
 const FAST_REFRESH_SECONDS = REFRESH_SECONDS ? Math.min(10, REFRESH_SECONDS) : 0;
+// Most polls are "light" (ps + docker stats only); every Nth does the full
+// report sweep. Deploys/config changes trigger a full refresh via events.
+const FULL_REFRESH_EVERY = 5;
 
 const LOG_CAP = 500;
 // Keep per-app log buffers around after leaving the view, so flipping between
@@ -59,6 +86,14 @@ interface LogLine {
 }
 
 type Focus = 'menu' | 'content';
+
+// Single-key actions that prefill (never auto-run) the `:` prompt for the
+// selected app. Uppercase so they can't collide with navigation keys.
+const QUICK_ACTIONS: Record<string, string> = {
+  R: 'ps:restart $app',
+  S: 'ps:stop $app',
+  B: 'ps:rebuild $app',
+};
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -105,6 +140,7 @@ function Header({
   host,
   count,
   cert,
+  disk,
   refreshing,
   age,
 }: {
@@ -112,6 +148,7 @@ function Header({
   host: string;
   count: number;
   cert: { app: string; days: number } | null;
+  disk: HostDisk | null;
   refreshing: boolean;
   age: number | null; // seconds since the last successful refresh
 }): ReactNode {
@@ -127,6 +164,11 @@ function Header({
       </Box>
       <Box>
         <Text color={refreshing ? theme.accent : theme.dim}>{padEnd(fresh, 8)}</Text>
+        {disk ? (
+          <Text color={disk.usedPct >= 90 ? theme.bad : disk.usedPct >= 80 ? theme.warn : theme.dim}>
+            disk {disk.usedPct}%{'  '}
+          </Text>
+        ) : null}
         {cert ? (
           <Text wrap="truncate-end" color={cert.days < 0 ? theme.bad : cert.days <= 14 ? theme.warn : theme.dim}>
             cert: {cert.app} {cert.days < 0 ? 'expired' : `${cert.days}d`}{'  '}
@@ -170,16 +212,18 @@ function AppSelector({
   selected,
   focused,
   height,
+  filter,
 }: {
   apps: DokkuApp[];
   selected: number;
   focused: boolean;
   height: number;
+  filter: string;
 }): ReactNode {
   const { start, items } = windowed(apps, selected, height);
   return (
     <Box flexDirection="column" width={20} flexShrink={0} borderStyle="round" borderColor={focused ? theme.accent : theme.dim} paddingX={1}>
-      <Text color={theme.dim}>APPS</Text>
+      <Text wrap="truncate-end" color={theme.dim}>APPS{filter ? <Text color={theme.warn}> /{filter}</Text> : null}</Text>
       {items.map((a, i) => {
         const idx = start + i;
         const sel = idx === selected;
@@ -193,6 +237,7 @@ function AppSelector({
           </Box>
         );
       })}
+      {apps.length === 0 ? <Text color={theme.dim}> no match</Text> : null}
     </Box>
   );
 }
@@ -202,12 +247,16 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
   const keys: Array<[string, string]> = [
     [`1-${VIEWS.length}`, 'view'],
     ['tab', focused === 'menu' ? 'focus list' : 'focus menu'],
-    ['↑↓', focused === 'menu' ? 'change view' : v.key === 'logs' ? 'scroll logs' : v.perApp ? 'select app' : 'scroll'],
+    ['↑↓', focused === 'menu' ? 'change view' : v.key === 'logs' ? 'scroll logs' : 'move'],
   ];
-  if (v.perApp) keys.push(['←→', 'switch app']);
-  if (v.key === 'config') keys.push(['s', 'reveal/hide']);
+  if (v.perApp) keys.push(['←→', 'app']);
+  if (v.key === 'apps' || v.perApp) keys.push(['↵', 'detail']);
+  if (v.key === 'cheatsheet') keys.push(['↵', 'insert cmd']);
+  if (v.key === 'apps' || v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter']);
+  if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal']);
   keys.push([':', 'command']);
   keys.push(['r', 'refresh']);
+  keys.push(['?', 'help']);
   keys.push(['q', 'quit']);
   return (
     <Box paddingX={1}>
@@ -219,7 +268,7 @@ function Footer({ view, focused }: { view: number; focused: Focus }): ReactNode 
           <Text color={theme.dim}>
             {' '}
             {label}
-            {i < keys.length - 1 ? '   ' : ''}
+            {i < keys.length - 1 ? '  ' : ''}
           </Text>
         </Text>
       ))}
@@ -243,49 +292,88 @@ function CommandBar({ text, app }: { text: string; app?: string }): ReactNode {
   );
 }
 
+// The `/` prompt that replaces the footer while a filter is being typed.
+function FilterBar({ text, target }: { text: string; target: string }): ReactNode {
+  return (
+    <Box paddingX={1}>
+      <Text color={theme.warn} bold>
+        / {' '}
+      </Text>
+      <Text>{text}</Text>
+      <Text color={theme.warn}>▌</Text>
+      <Text wrap="truncate-end" color={theme.dim}>
+        {'   '}filter {target} · enter keep · esc clear
+      </Text>
+    </Box>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
 
 function AppsView({
   apps,
+  stats,
+  selected,
+  focused,
   viewport,
-  scroll,
 }: {
   apps: DokkuApp[];
+  stats: StatsMap | null;
+  selected: number;
+  focused: boolean;
   viewport: number;
-  scroll: number;
 }): ReactNode {
   if (apps.length === 0) return <Text color={theme.dim}>No apps found.</Text>;
   // Fixed-width columns first, then the flexible DOMAIN column last so it can
   // truncate without disturbing alignment. Every cell is truncate-end so a
   // narrow terminal degrades gracefully instead of wrapping the grid.
   const nameW = Math.min(28, Math.max(10, ...apps.map((a) => a.name.length)) + 2);
-  const statusW = 16;
-  const procW = 16;
+  const statusW = 15;
+  const procW = 13;
+  const cpuW = 7;
+  const memW = 7;
   const sslW = 11;
+  const { start, items } = windowed(apps, selected, viewport - 1);
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end" color={theme.dim}>
-        {padEnd('NAME', nameW) + padEnd('STATUS', statusW) + padEnd('PROCESSES', procW) + padEnd('SSL', sslW) + 'DOMAIN'}
+        {'  ' +
+          padEnd('NAME', nameW) +
+          padEnd('STATUS', statusW) +
+          padEnd('PROCESSES', procW) +
+          padEnd('CPU', cpuW) +
+          padEnd('MEM', memW) +
+          padEnd('SSL', sslW) +
+          'DOMAIN'}
       </Text>
-      {apps.slice(scroll, scroll + viewport).map((a) => {
+      {items.map((a, i) => {
+        const sel = start + i === selected;
         const rb = runningBadge(a);
         const proc = a.processes.map((p) => `${p.type}×${p.scale}`).join(' ') || '—';
         const domain =
           a.domains.length === 0 ? '—' : a.domains[0] + (a.domains.length > 1 ? ` +${a.domains.length - 1}` : '');
         const sb = sslBadge(a.ssl);
+        const usage = appUsage(a, stats);
         return (
           <Box key={a.name}>
-            <Text wrap="truncate-end" bold>{padEnd(a.name, nameW)}</Text>
+            <Text color={theme.accent}>{sel ? '› ' : '  '}</Text>
+            <Text wrap="truncate-end" bold backgroundColor={sel && focused ? theme.accent : undefined} color={sel && focused ? 'black' : theme.text}>
+              {padEnd(a.name, nameW)}
+            </Text>
             <Text wrap="truncate-end" color={rb.color}>{padEnd(rb.text, statusW)}</Text>
             <Text wrap="truncate-end">{padEnd(proc, procW)}</Text>
+            <Text wrap="truncate-end" color={usage.cpu !== null && usage.cpu >= 80 ? theme.warn : theme.dim}>
+              {padEnd(fmtPct(usage.cpu), cpuW)}
+            </Text>
+            <Text wrap="truncate-end" color={theme.dim}>{padEnd(fmtBytes(usage.mem), memW)}</Text>
             <Text wrap="truncate-end" color={sb.color}>{padEnd(sb.text, sslW)}</Text>
             <Text wrap="truncate-end" color={theme.dim}>{domain}</Text>
           </Box>
         );
       })}
-      {scrollHint(apps.length, scroll, viewport)}
+      {windowHint(apps.length, start, items.length)}
     </Box>
   );
 }
@@ -345,7 +433,7 @@ function statusColor(s: string): string {
   return theme.warn;
 }
 
-function ProcessView({ app }: { app?: DokkuApp }): ReactNode {
+function ProcessView({ app, stats }: { app?: DokkuApp; stats: StatsMap | null }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
   const rb = runningBadge(app);
   return (
@@ -364,13 +452,22 @@ function ProcessView({ app }: { app?: DokkuApp }): ReactNode {
           <Text bold>
             {p.type} <Text color={theme.dim}>scale {p.scale}</Text>
           </Text>
-          {p.instances.map((inst) => (
-            <Text key={inst.index} wrap="truncate-end">
-              {'  '}
-              {p.type}.{inst.index}{'  '}
-              <Text color={statusColor(inst.status)}>{inst.status}</Text>
-            </Text>
-          ))}
+          {p.instances.map((inst) => {
+            const s = stats?.[`${app.name}.${p.type}.${inst.index}`];
+            return (
+              <Text key={inst.index} wrap="truncate-end">
+                {'  '}
+                {p.type}.{inst.index}{'  '}
+                <Text color={statusColor(inst.status)}>{inst.status}</Text>
+                {s ? (
+                  <Text color={theme.dim}>
+                    {'  '}cpu {fmtPct(s.cpuPct)} · mem {fmtBytes(s.memBytes)}
+                    {s.memLimitBytes ? ` / ${fmtBytes(s.memLimitBytes)}` : ''}
+                  </Text>
+                ) : null}
+              </Text>
+            );
+          })}
         </Box>
       ))}
     </Box>
@@ -476,6 +573,224 @@ function LogsView({
   );
 }
 
+function ServicesView({
+  services,
+  loading,
+  cursor,
+  focused,
+  reveal,
+  viewport,
+}: {
+  services: DokkuService[] | null;
+  loading: boolean;
+  cursor: number;
+  focused: boolean;
+  reveal: boolean;
+  viewport: number;
+}): ReactNode {
+  if (loading && !services) return <Text color={theme.dim}>Probing datastore plugins…</Text>;
+  const list = services ?? [];
+  if (list.length === 0) {
+    return (
+      <Box flexDirection="column">
+        <Text color={theme.dim}>No datastore services found.</Text>
+        <Text> </Text>
+        <Text wrap="truncate-end" color={theme.dim}>
+          Install a plugin (postgres, redis, mysql, …) and create services to see them here:
+        </Text>
+        <Text wrap="truncate-end" color={theme.good}>  sudo dokku plugin:install https://github.com/dokku/dokku-postgres.git</Text>
+        <Text wrap="truncate-end" color={theme.good}>  dokku postgres:create my-db && dokku postgres:link my-db my-app</Text>
+      </Box>
+    );
+  }
+  const pluginW = 12;
+  const nameW = Math.min(24, Math.max(6, ...list.map((s) => s.name.length)) + 2);
+  const statusW = 10;
+  const versionW = 20;
+  const listRows = Math.max(3, viewport - 7);
+  const { start, items } = windowed(list, cursor, listRows);
+  const sel = list[cursor];
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end" color={theme.dim}>
+        {'  ' + padEnd('PLUGIN', pluginW) + padEnd('NAME', nameW) + padEnd('STATUS', statusW) + padEnd('VERSION', versionW) + 'LINKED APPS'}
+      </Text>
+      {items.map((s, i) => {
+        const isSel = start + i === cursor;
+        const stColor = s.status && /run/i.test(s.status) ? theme.good : s.status ? theme.bad : theme.dim;
+        return (
+          <Box key={`${s.plugin}/${s.name}`}>
+            <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
+            <Text wrap="truncate-end" color={theme.dim}>{padEnd(s.plugin, pluginW)}</Text>
+            <Text wrap="truncate-end" bold backgroundColor={isSel && focused ? theme.accent : undefined} color={isSel && focused ? 'black' : theme.text}>
+              {padEnd(s.name, nameW)}
+            </Text>
+            <Text wrap="truncate-end" color={stColor}>{padEnd(s.status ?? '?', statusW)}</Text>
+            <Text wrap="truncate-end" color={theme.dim}>{padEnd(s.version ?? '—', versionW)}</Text>
+            <Text wrap="truncate-end">{s.links.join(' ') || '—'}</Text>
+          </Box>
+        );
+      })}
+      {windowHint(list.length, start, items.length)}
+      {sel ? (
+        <>
+          <Text> </Text>
+          <Text wrap="truncate-end" bold color={theme.accent}>
+            {sel.plugin}/{sel.name}
+          </Text>
+          {sel.exposedPorts ? <Text wrap="truncate-end"> Exposed: {sel.exposedPorts}</Text> : null}
+          <Text wrap="truncate-end">
+            {' '}DSN: {sel.dsn ? (
+              <Text color={reveal ? theme.text : theme.dim}>{reveal ? sel.dsn : '•'.repeat(12) + '  (s to reveal)'}</Text>
+            ) : (
+              <Text color={theme.dim}>—</Text>
+            )}
+          </Text>
+        </>
+      ) : null}
+    </Box>
+  );
+}
+
+function DetailView({
+  app,
+  detail,
+  loading,
+  services,
+  stats,
+}: {
+  app?: DokkuApp;
+  detail?: AppDetail;
+  loading: boolean;
+  services: DokkuService[] | null;
+  stats: StatsMap | null;
+}): ReactNode {
+  if (!app) return <Text color={theme.dim}>No app selected.</Text>;
+  const rb = runningBadge(app);
+  const usage = appUsage(app, stats);
+  const linked = (services ?? []).filter((s) => s.links.includes(app.name));
+  const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
+  const sb = sslBadge(app.ssl);
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>{app.name}</Text>
+        {'  '}
+        <Text color={rb.color}>{rb.text}</Text>
+        <Text color={theme.dim}>   esc closes · ←→ other apps</Text>
+      </Text>
+      <Text wrap="truncate-end" color={theme.dim}>
+        created {fmtDate(app.createdAt)} · deploy {app.deploySource || '—'} · restart {app.restartPolicy || '—'}
+        {usage.cpu !== null || usage.mem !== null ? ` · cpu ${fmtPct(usage.cpu)} · mem ${fmtBytes(usage.mem)}` : ''}
+      </Text>
+      <Text> </Text>
+      {loading && !detail ? <Text color={theme.dim}>Loading detail reports…</Text> : null}
+      {detail ? (
+        <>
+          <Text color={theme.dim}>GIT</Text>
+          {detail.git.sourceImage ? (
+            <Text wrap="truncate-end"> image {detail.git.sourceImage}</Text>
+          ) : detail.git.sha || detail.git.branch ? (
+            <Text wrap="truncate-end">
+              {' '}branch {detail.git.branch ?? '—'} · sha {detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed{' '}
+              {fmtDate(detail.git.lastUpdated)}
+            </Text>
+          ) : (
+            <Text color={theme.dim}> (no git metadata)</Text>
+          )}
+          <Text> </Text>
+          <Text color={theme.dim}>PORTS</Text>
+          {detail.ports.length === 0 ? (
+            <Text color={theme.dim}> (none mapped)</Text>
+          ) : (
+            detail.ports.map((p) => (
+              <Text key={p} wrap="truncate-end"> • {p}</Text>
+            ))
+          )}
+          <Text> </Text>
+          <Text color={theme.dim}>STORAGE</Text>
+          {detail.storage.length === 0 ? (
+            <Text color={theme.dim}> (no persistent mounts)</Text>
+          ) : (
+            detail.storage.map((s) => (
+              <Text key={s} wrap="truncate-end"> • {s}</Text>
+            ))
+          )}
+          <Text> </Text>
+          <Text color={theme.dim}>NETWORK</Text>
+          <Text wrap="truncate-end">
+            {' '}initial {detail.network.initial ?? '—'}
+            {detail.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
+            {detail.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
+          </Text>
+          <Text> </Text>
+        </>
+      ) : null}
+      <Text color={theme.dim}>DOMAINS & SSL</Text>
+      <Text wrap="truncate-end">
+        {' '}
+        {app.domains.length === 0 ? '(no domains)' : app.domains.join(' · ')}
+      </Text>
+      <Text wrap="truncate-end">
+        {' '}ssl <Text color={sb.color}>{sb.text}</Text>
+        {app.ssl && days !== null ? <Text color={theme.dim}> · expires {fmtDate(app.ssl.expiresAt)} ({days}d)</Text> : null}
+      </Text>
+      <Text> </Text>
+      <Text color={theme.dim}>LINKED SERVICES</Text>
+      {services === null ? (
+        <Text color={theme.dim}> (open the Services view once to load links)</Text>
+      ) : linked.length === 0 ? (
+        <Text color={theme.dim}> (none)</Text>
+      ) : (
+        linked.map((s) => (
+          <Text key={`${s.plugin}/${s.name}`} wrap="truncate-end">
+            {' '}• {s.plugin}/{s.name} <Text color={s.status && /run/i.test(s.status) ? theme.good : theme.warn}>{s.status ?? '?'}</Text>
+          </Text>
+        ))
+      )}
+    </Box>
+  );
+}
+
+function HelpView(): ReactNode {
+  const rows: Array<[string, string] | null> = [
+    ['1-7', 'jump to a view'],
+    ['tab', 'toggle focus between menu and list/content'],
+    ['↑↓ / jk', 'move selection · scroll logs/config'],
+    ['←→ / hl', 'switch app in per-app views'],
+    ['enter', 'open app detail (Apps & per-app views) · insert cheat-sheet command'],
+    ['esc', 'close detail/help · cancel prompt · kill running command'],
+    ['/', 'filter the app list (or cheat sheet) · esc clears'],
+    ['s', 'reveal/hide secrets (Config values, service DSN)'],
+    null,
+    ['R / S / B', 'prefill restart / stop / rebuild for the selected app'],
+    [':', 'type any dokku command ($app → selected app, ↑↓ history)'],
+    ['r', 'refresh now (full report sweep)'],
+    ['q / ctrl-c', 'quit'],
+    null,
+    ['DOKKU_DASH_SSH', 'run remotely: dokku@host (dokku commands only) or user@host'],
+    ['DOKKU_DASH_REFRESH', 'poll seconds (default 30, 0 = off)'],
+    ['DOKKU_DASH_BIN', 'dokku binary path'],
+    ['dokku events:on', 'enable push-based refresh on the host'],
+  ];
+  return (
+    <Box flexDirection="column">
+      {rows.map((r, i) =>
+        r === null ? (
+          <Text key={i}> </Text>
+        ) : (
+          <Box key={i}>
+            <Text color={theme.accent} bold>
+              {padEnd(r[0], 20)}
+            </Text>
+            <Text wrap="truncate-end" color={theme.text}>{r[1]}</Text>
+          </Box>
+        ),
+      )}
+    </Box>
+  );
+}
+
 function CommandView({
   cmd,
   running,
@@ -523,45 +838,70 @@ type CheatLine =
   | { type: 'group'; text: string }
   | { type: 'item'; cmd: string; desc: string };
 
-function cheatLines(): CheatLine[] {
+function cheatLines(filter: string): CheatLine[] {
   const out: CheatLine[] = [];
-  CHEATSHEET.forEach((g, gi) => {
-    if (gi > 0) out.push({ type: 'spacer' });
+  const f = filter.toLowerCase();
+  for (const g of CHEATSHEET) {
+    const items = f
+      ? g.items.filter(([cmd, desc]) => cmd.toLowerCase().includes(f) || desc.toLowerCase().includes(f))
+      : g.items;
+    if (items.length === 0) continue;
+    if (out.length > 0) out.push({ type: 'spacer' });
     out.push({ type: 'group', text: g.group });
-    g.items.forEach(([cmd, desc]) => out.push({ type: 'item', cmd, desc }));
-  });
+    items.forEach(([cmd, desc]) => out.push({ type: 'item', cmd, desc }));
+  }
   return out;
+}
+
+// "dokku ps:restart <app>" -> "ps:restart $app" for the `:` prompt; null when
+// the entry isn't a dokku command (e.g. the `git remote add` line).
+export function cheatToCommand(cmd: string): string | null {
+  let c = cmd.trim();
+  if (c.startsWith('sudo ')) c = c.slice(5);
+  if (!c.startsWith('dokku ')) return null;
+  return c.slice(6).replace(/<app>/g, '$app');
 }
 
 function CheatsheetView({
   width,
   viewport,
-  scroll,
+  cursor,
+  focused,
+  filter,
 }: {
   width: number;
   viewport: number;
-  scroll: number;
+  cursor: number;
+  focused: boolean;
+  filter: string;
 }): ReactNode {
-  const lines = cheatLines();
+  const lines = cheatLines(filter);
+  if (lines.length === 0) return <Text color={theme.dim}>No commands match “{filter}”.</Text>;
   const cmdW = Math.min(44, Math.max(22, Math.floor(width * 0.5)));
+  const { start, items } = windowed(lines, Math.min(cursor, lines.length - 1), viewport);
   return (
     <Box flexDirection="column">
-      {lines.slice(scroll, scroll + viewport).map((l, i) => {
-        if (l.type === 'spacer') return <Text key={i}> </Text>;
+      {items.map((l, i) => {
+        const idx = start + i;
+        if (l.type === 'spacer') return <Text key={idx}> </Text>;
         if (l.type === 'group')
           return (
-            <Text key={i} bold color={theme.accent}>
+            <Text key={idx} bold color={theme.accent}>
               ▌ {l.text}
             </Text>
           );
+        const sel = idx === cursor;
         return (
-          <Box key={i}>
-            <Text wrap="truncate-end" color={theme.good}>{padEnd(truncate(l.cmd, cmdW), cmdW)}</Text>
+          <Box key={idx}>
+            <Text color={theme.accent}>{sel ? '›' : ' '}</Text>
+            <Text wrap="truncate-end" backgroundColor={sel && focused ? theme.accent : undefined} color={sel && focused ? 'black' : theme.good}>
+              {padEnd(truncate(l.cmd, cmdW), cmdW)}
+            </Text>
             <Text wrap="truncate-end" color={theme.dim}> {l.desc}</Text>
           </Box>
         );
       })}
-      {scrollHint(lines.length, scroll, viewport)}
+      {windowHint(lines.length, start, items.length)}
     </Box>
   );
 }
@@ -572,6 +912,15 @@ function scrollHint(total: number, scroll: number, viewport: number): ReactNode 
   const parts: string[] = [];
   if (scroll > 0) parts.push(`↑ ${scroll} above`);
   if (more > 0) parts.push(`↓ ${more} below`);
+  return <Text color={theme.dim}>{'  '}{parts.join('   ')}</Text>;
+}
+
+function windowHint(total: number, start: number, shown: number): ReactNode {
+  if (total <= shown) return null;
+  const below = total - (start + shown);
+  const parts: string[] = [];
+  if (start > 0) parts.push(`↑ ${start} above`);
+  if (below > 0) parts.push(`↓ ${below} below`);
   return <Text color={theme.dim}>{'  '}{parts.join('   ')}</Text>;
 }
 
@@ -588,17 +937,34 @@ export default function App(): ReactNode {
   const [selectedApp, setSelectedApp] = useState(0);
   const [scroll, setScroll] = useState(0);
   const [reveal, setReveal] = useState(false);
+  const [svcReveal, setSvcReveal] = useState(false);
+  const [svcCursor, setSvcCursor] = useState(0);
+  const [cheatCursor, setCheatCursor] = useState(1); // first item under first group
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const [data, setData] = useState<Overview | null>(null);
+  const [stats, setStats] = useState<StatsResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  // Bumped on every successful refresh; config entries carry the version they
-  // were fetched under, so stale ones refetch silently on the next look.
+  // Bumped on every successful *full* refresh; config/services/detail entries
+  // carry the version they were fetched under, so stale ones refetch silently
+  // on the next look.
   const [dataV, setDataV] = useState(0);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [configCache, setConfigCache] = useState<Record<string, { vars: Record<string, string>; v: number }>>({});
   const [configLoading, setConfigLoading] = useState(false);
+  const [services, setServices] = useState<{ list: DokkuService[]; v: number } | null>(null);
+  const [servicesLoading, setServicesLoading] = useState(false);
+  const [detailCache, setDetailCache] = useState<Record<string, { detail: AppDetail; v: number }>>({});
+  const [detailLoading, setDetailLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
+
+  // `/` filters — one for the app list (shared by every app-listing view) and
+  // one for the cheat sheet. filterInput is the live typing buffer.
+  const [appFilter, setAppFilter] = useState('');
+  const [cheatFilter, setCheatFilter] = useState('');
+  const [filterInput, setFilterInput] = useState<string | null>(null);
 
   // `:` command line — the prompt text (null = closed), the running/finished
   // command overlay, its streamed output, and a session-local history.
@@ -610,22 +976,42 @@ export default function App(): ReactNode {
   const [cmdScroll, setCmdScroll] = useState(0);
   const cmdStopRef = useRef<(() => void) | null>(null);
 
-  const apps = data ? data.apps : [];
-  const source: Source = data ? data.source : 'demo';
   const currentView = VIEWS[view];
+  const source: Source = data ? data.source : 'demo';
+
+  const filterTarget: 'apps' | 'cheat' = currentView.key === 'cheatsheet' ? 'cheat' : 'apps';
+  const appFilterLive = filterInput !== null && filterTarget === 'apps' ? filterInput : appFilter;
+  const cheatFilterLive = filterInput !== null && filterTarget === 'cheat' ? filterInput : cheatFilter;
+
+  const allApps = data ? data.apps : [];
+  const apps = appFilterLive
+    ? allApps.filter((a) => a.name.toLowerCase().includes(appFilterLive.toLowerCase()))
+    : allApps;
   const currentApp: DokkuApp | undefined = apps[selectedApp];
+  const statsMap: StatsMap | null = stats?.stats ?? null;
 
   // One refresh path for launch, `r`, the poll timer and pushed events — it
   // never flashes the spinner and never drops caches; versioning (dataV)
-  // invalidates config entries instead.
+  // invalidates config entries instead. Light mode re-fetches only process
+  // status + docker stats and keeps the rest of the previous snapshot.
+  const dataRef = useRef<Overview | null>(null);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
   const refreshInFlight = useRef(false);
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (mode: 'full' | 'light' = 'full') => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     setRefreshing(true);
-    const result = await loadOverview();
+    const prev = dataRef.current;
+    const light = mode === 'light' && prev !== null;
+    const [result, statsResult] = await Promise.all([
+      light ? loadOverviewLight(prev!) : loadOverview(),
+      loadStats(),
+    ]);
     setData(result);
-    setDataV((v) => v + 1);
+    setStats(statsResult);
+    if (!light) setDataV((v) => v + 1);
     setLastUpdated(Date.now());
     setLoading(false);
     setRefreshing(false);
@@ -633,14 +1019,16 @@ export default function App(): ReactNode {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    void refresh('full');
   }, [refresh]);
 
   const pollSeconds = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
+  const pollCount = useRef(0);
   useEffect(() => {
     if (!pollSeconds) return;
     const t = setInterval(() => {
-      void refresh();
+      pollCount.current++;
+      void refresh(pollCount.current % FULL_REFRESH_EVERY === 0 ? 'full' : 'light');
     }, pollSeconds * 1000);
     return () => clearInterval(t);
   }, [refresh, pollSeconds]);
@@ -655,7 +1043,7 @@ export default function App(): ReactNode {
       if (timer) return; // a deploy emits a burst of events — refresh once
       timer = setTimeout(() => {
         timer = null;
-        void refresh();
+        void refresh('full');
       }, 2000);
     });
     return () => {
@@ -700,7 +1088,7 @@ export default function App(): ReactNode {
       clearInterval(flush);
       flushNow();
       setCmdRun((r) => (r ? { ...r, running: false } : r));
-      void refresh(); // the command may have changed state — show it
+      void refresh('full'); // the command may have changed state — show it
     });
     cmdStopRef.current = () => {
       clearInterval(flush);
@@ -720,11 +1108,26 @@ export default function App(): ReactNode {
 
   useEffect(() => {
     setScroll(0);
+    setDetailOpen(false);
   }, [view]);
 
   useEffect(() => {
     if (selectedApp > apps.length - 1) setSelectedApp(Math.max(0, apps.length - 1));
   }, [apps.length, selectedApp]);
+
+  useEffect(() => {
+    const total = services?.list.length ?? 0;
+    if (svcCursor > total - 1) setSvcCursor(Math.max(0, total - 1));
+  }, [services, svcCursor]);
+
+  // Keep the cheat-sheet cursor parked on an item row when the filter changes.
+  useEffect(() => {
+    if (currentView.key !== 'cheatsheet') return;
+    const lines = cheatLines(cheatFilterLive);
+    if (lines[cheatCursor]?.type === 'item') return;
+    const first = lines.findIndex((l) => l.type === 'item');
+    if (first !== -1) setCheatCursor(first);
+  }, [currentView.key, cheatFilterLive, cheatCursor]);
 
   // Tail logs while the Logs view is showing an app. Lines are buffered and
   // flushed on an interval so a chatty app doesn't re-render per line.
@@ -791,6 +1194,39 @@ export default function App(): ReactNode {
     };
   }, [currentView.key, currentApp, source, configCache, dataV]);
 
+  // Lazily load datastore services on first visit; refetch when dataV moves.
+  useEffect(() => {
+    if (currentView.key !== 'services') return;
+    if (services && services.v === dataV) return;
+    let cancelled = false;
+    if (!services) setServicesLoading(true);
+    void loadServices().then((res) => {
+      if (cancelled) return;
+      setServices({ list: res.services, v: dataV });
+      setServicesLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentView.key, services, dataV]);
+
+  // Lazily load the drill-in reports while the detail pane is open.
+  useEffect(() => {
+    if (!detailOpen || !currentApp) return;
+    const entry = detailCache[currentApp.name];
+    if (entry && entry.v === dataV) return;
+    let cancelled = false;
+    if (!entry) setDetailLoading(true);
+    void loadAppDetail(currentApp.name, source).then((d) => {
+      if (cancelled) return;
+      setDetailCache((c) => ({ ...c, [currentApp.name]: { detail: d, v: dataV } }));
+      setDetailLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [detailOpen, currentApp, source, detailCache, dataV]);
+
   // Layout sizing. Boxes get explicit widths that sum to `columns` so nothing
   // overflows; `colBudget` is the usable text width inside the content pane
   // (minus borders, padding and a safety margin so lines never soft-wrap).
@@ -803,6 +1239,14 @@ export default function App(): ReactNode {
   const clampScroll = useCallback((delta: number, total: number) => {
     setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - viewport)));
   }, [viewport]);
+
+  // Prefill a quick action into the `:` prompt (never auto-runs).
+  const quickAction = (ch: string): boolean => {
+    const cmd = QUICK_ACTIONS[ch];
+    if (!cmd || !currentApp) return false;
+    setCmdInput(cmd);
+    return true;
+  };
 
   useInput((input, key) => {
     if (key.ctrl && input === 'c') {
@@ -843,6 +1287,37 @@ export default function App(): ReactNode {
       return;
     }
 
+    // The `/` filter prompt: live-applied while typing; enter keeps, esc clears.
+    if (filterInput !== null) {
+      const commit = (value: string) => {
+        if (filterTarget === 'cheat') setCheatFilter(value);
+        else setAppFilter(value);
+        setFilterInput(null);
+      };
+      if (key.escape) {
+        commit('');
+        return;
+      }
+      if (key.return) {
+        commit(filterInput);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setFilterInput((s) => (s ?? '').slice(0, -1));
+        return;
+      }
+      if (input && !key.ctrl && !key.meta && !key.tab && !key.upArrow && !key.downArrow) {
+        setFilterInput((s) => (s ?? '') + input);
+      }
+      return;
+    }
+
+    // Help overlay swallows everything except its close keys.
+    if (helpOpen) {
+      if (key.escape || input === 'q' || input === '?') setHelpOpen(false);
+      return;
+    }
+
     // Command output overlay: scroll, close (esc/q), or type another command.
     if (cmdRun) {
       if (key.escape || input === 'q') {
@@ -864,12 +1339,53 @@ export default function App(): ReactNode {
       return;
     }
 
+    // App detail drill-in: browse other apps without leaving it.
+    if (detailOpen) {
+      if (key.escape || input === 'q' || key.backspace || key.delete) {
+        setDetailOpen(false);
+        return;
+      }
+      const left = key.leftArrow || input === 'h';
+      const right = key.rightArrow || input === 'l';
+      if (left || right || key.upArrow || key.downArrow || input === 'j' || input === 'k') {
+        const fwd = right || key.downArrow || input === 'j';
+        setSelectedApp((i) => Math.min(Math.max(0, i + (fwd ? 1 : -1)), apps.length - 1));
+        return;
+      }
+      if (input === ':') {
+        setCmdInput('');
+        return;
+      }
+      if (input === '?') {
+        setHelpOpen(true);
+        return;
+      }
+      if (input === 'r') {
+        void refresh('full');
+        return;
+      }
+      if (quickAction(input)) return;
+      if (input >= '1' && input <= String(VIEWS.length)) {
+        setDetailOpen(false);
+        setView(Number(input) - 1);
+      }
+      return;
+    }
+
     if (input === 'q') {
       exit();
       return;
     }
     if (input === ':') {
       setCmdInput('');
+      return;
+    }
+    if (input === '?') {
+      setHelpOpen(true);
+      return;
+    }
+    if (input === '/' && (currentView.key === 'apps' || currentView.perApp || currentView.key === 'cheatsheet')) {
+      setFilterInput(filterTarget === 'cheat' ? cheatFilter : appFilter);
       return;
     }
     if (input >= '1' && input <= String(VIEWS.length)) {
@@ -881,11 +1397,32 @@ export default function App(): ReactNode {
       return;
     }
     if (input === 'r') {
-      void refresh();
+      void refresh('full');
       return;
     }
     if (input === 's' && currentView.key === 'config') {
       setReveal((v) => !v);
+      return;
+    }
+    if (input === 's' && currentView.key === 'services') {
+      setSvcReveal((v) => !v);
+      return;
+    }
+    if ((currentView.key === 'apps' || currentView.perApp) && quickAction(input)) return;
+
+    if (key.return) {
+      if (currentView.key === 'cheatsheet') {
+        const lines = cheatLines(cheatFilterLive);
+        const line = lines[cheatCursor];
+        if (line?.type === 'item') {
+          const cmd = cheatToCommand(line.cmd);
+          if (cmd) setCmdInput(cmd);
+        }
+        return;
+      }
+      if ((currentView.key === 'apps' || currentView.perApp) && currentApp) {
+        setDetailOpen(true);
+      }
       return;
     }
 
@@ -909,6 +1446,24 @@ export default function App(): ReactNode {
       return;
     }
     // focus === 'content'
+    if (currentView.key === 'apps') {
+      setSelectedApp((i) => Math.min(Math.max(0, i + delta), apps.length - 1));
+      return;
+    }
+    if (currentView.key === 'services') {
+      const total = services?.list.length ?? 0;
+      setSvcCursor((i) => Math.min(Math.max(0, i + delta), Math.max(0, total - 1)));
+      return;
+    }
+    if (currentView.key === 'cheatsheet') {
+      const lines = cheatLines(cheatFilterLive);
+      setCheatCursor((c) => {
+        let i = c + delta;
+        while (i >= 0 && i < lines.length && lines[i].type !== 'item') i += delta;
+        return i >= 0 && i < lines.length ? i : c;
+      });
+      return;
+    }
     if (currentView.perApp) {
       if (currentView.key === 'logs') {
         // ↑ digs into scrollback, ↓ moves back toward the live tail.
@@ -925,16 +1480,13 @@ export default function App(): ReactNode {
       }
       setSelectedApp((i) => Math.min(Math.max(0, i + delta), apps.length - 1));
       setScroll(0);
-    } else {
-      const total = currentView.key === 'cheatsheet' ? cheatLines().length : apps.length;
-      clampScroll(delta, total);
     }
   });
 
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} cert={null} refreshing={false} age={null} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} age={null} />
         <Loading />
       </Box>
     );
@@ -943,13 +1495,13 @@ export default function App(): ReactNode {
   let content: ReactNode = null;
   switch (currentView.key) {
     case 'apps':
-      content = <AppsView apps={apps} viewport={viewport} scroll={scroll} />;
+      content = <AppsView apps={apps} stats={statsMap} selected={selectedApp} focused={focus === 'content'} viewport={viewport} />;
       break;
     case 'domains':
       content = <DomainsView app={currentApp} />;
       break;
     case 'process':
-      content = <ProcessView app={currentApp} />;
+      content = <ProcessView app={currentApp} stats={statsMap} />;
       break;
     case 'config':
       content = (
@@ -966,12 +1518,50 @@ export default function App(): ReactNode {
     case 'logs':
       content = <LogsView app={currentApp} lines={logLines} viewport={viewport} offset={scroll} width={colBudget} />;
       break;
+    case 'services':
+      content = (
+        <ServicesView
+          services={services?.list ?? null}
+          loading={servicesLoading}
+          cursor={svcCursor}
+          focused={focus === 'content'}
+          reveal={svcReveal}
+          viewport={viewport}
+        />
+      );
+      break;
     case 'cheatsheet':
-      content = <CheatsheetView width={colBudget} viewport={viewport} scroll={scroll} />;
+      content = (
+        <CheatsheetView
+          width={colBudget}
+          viewport={viewport}
+          cursor={cheatCursor}
+          focused={focus === 'content'}
+          filter={cheatFilterLive}
+        />
+      );
       break;
   }
-  // A `:` command's output takes over the content pane until dismissed.
+  // Overlays take over the content pane until dismissed.
+  let paneTitle = currentView.label.toUpperCase();
+  if (detailOpen) {
+    paneTitle = 'APP DETAIL';
+    content = (
+      <DetailView
+        app={currentApp}
+        detail={currentApp ? detailCache[currentApp.name]?.detail : undefined}
+        loading={detailLoading}
+        services={services ? services.list : null}
+        stats={statsMap}
+      />
+    );
+  }
+  if (helpOpen) {
+    paneTitle = 'HELP';
+    content = <HelpView />;
+  }
   if (cmdRun) {
+    paneTitle = 'COMMAND';
     content = (
       <CommandView
         cmd={cmdRun.cmd}
@@ -984,20 +1574,22 @@ export default function App(): ReactNode {
     );
   }
 
+  const activeFilter = currentView.key === 'cheatsheet' ? cheatFilterLive : appFilterLive;
   return (
     <Box flexDirection="column" height={rows}>
       <Header
         source={source}
         host={hostLabel()}
-        count={apps.length}
-        cert={soonestCert(apps)}
+        count={allApps.length}
+        cert={soonestCert(allApps)}
+        disk={stats?.disk ?? null}
         refreshing={refreshing && !loading}
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
       <Box flexGrow={1}>
         <Menu view={view} focused={focus === 'menu'} />
         {currentView.perApp ? (
-          <AppSelector apps={apps} selected={selectedApp} focused={focus === 'content'} height={viewport} />
+          <AppSelector apps={apps} selected={selectedApp} focused={focus === 'content'} height={viewport} filter={appFilterLive} />
         ) : null}
         <Box
           width={contentW}
@@ -1007,12 +1599,17 @@ export default function App(): ReactNode {
           borderColor={focus === 'content' && !currentView.perApp ? theme.accent : theme.dim}
           paddingX={1}
         >
-          <Text color={theme.dim}>{cmdRun ? 'COMMAND' : currentView.label.toUpperCase()}</Text>
+          <Text wrap="truncate-end" color={theme.dim}>
+            {paneTitle}
+            {!cmdRun && !helpOpen && activeFilter ? <Text color={theme.warn}>  /{activeFilter}</Text> : null}
+          </Text>
           {content}
         </Box>
       </Box>
       {cmdInput !== null ? (
         <CommandBar text={cmdInput} app={currentApp?.name} />
+      ) : filterInput !== null ? (
+        <FilterBar text={filterInput} target={filterTarget === 'cheat' ? 'cheat sheet' : 'apps'} />
       ) : (
         <Footer view={view} focused={focus} />
       )}
@@ -1021,5 +1618,5 @@ export default function App(): ReactNode {
 }
 
 function hostLabel(): string {
-  return process.env.DOKKU_DASH_HOST || process.env.HOSTNAME || 'local';
+  return process.env.DOKKU_DASH_HOST || remoteLabel() || process.env.HOSTNAME || 'local';
 }
