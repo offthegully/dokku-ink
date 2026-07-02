@@ -46,7 +46,28 @@ if (!process.stdout.isTTY && process.env.DOKKU_DASH_DEMO !== '1') {
   process.exit(1);
 }
 
-const { waitUntilExit } = render(<App />, { exitOnCtrlC: false });
+// Ink repaints the whole frame on every render (freshness tick, poll results,
+// lazy detail loads), and the erase-then-rewrite is visible as flicker on many
+// terminals. Wrapping each write in DEC 2026 "synchronized output" markers
+// makes supporting terminals (iTerm2, Ghostty, Kitty, WezTerm, …) buffer the
+// repaint and swap it in atomically; others ignore the markers unharmed.
+const syncStdout = process.stdout.isTTY
+  ? (new Proxy(process.stdout, {
+      get(target, prop) {
+        if (prop === 'write') {
+          return (chunk: string | Uint8Array, ...rest: unknown[]) =>
+            (target.write as (...args: unknown[]) => boolean)(
+              `\u001B[?2026h${chunk}\u001B[?2026l`,
+              ...rest,
+            );
+        }
+        const value = target[prop as keyof typeof target];
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as unknown as NodeJS.WriteStream)
+  : process.stdout;
+
+const { waitUntilExit } = render(<App />, { stdout: syncStdout, exitOnCtrlC: false });
 await waitUntilExit();
 
 function printHelp(): void {
@@ -65,10 +86,10 @@ OPTIONS
 
 KEYS (inside the dashboard)
   1-7            Jump to a view
-  ↑ / ↓ (j/k)    Move within the focused pane (scrollback in Logs)
-  ← / → (h/l)    Switch app (in per-app views)
-  enter          Open the app detail drill-in; insert a cheat-sheet command
-  tab            Toggle focus between the menu and the list/content
+  ↑ / ↓          Select the app in the table (move in Services/Cheat Sheet)
+  ← / → (h/l)    Switch view (tab / shift-tab too)
+  j / k          Scroll the detail pane (Logs scrollback, long Config lists)
+  enter          Insert a cheat-sheet command into the : prompt
   /              Filter the app list (or the cheat sheet); esc clears
   s              Reveal / hide secrets (Config values, service DSN)
   R / S / B      Prefill restart / stop / rebuild for the selected app

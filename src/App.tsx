@@ -369,7 +369,16 @@ function AppSummary({
           </Text>
         </>
       ) : (
-        <Text color={theme.dim}>{loading ? 'Loading detail reports…' : ' '}</Text>
+        // Same rows as the loaded state so the pane doesn't collapse and
+        // re-expand (a visible flash) while the detail reports stream in.
+        <>
+          {(['GIT', 'PORTS', 'STORAGE', 'NETWORK'] as const).map((t) => (
+            <Text key={t} wrap="truncate-end">
+              {lbl(t)}
+              <Text color={theme.dim}>{loading ? '…' : '—'}</Text>
+            </Text>
+          ))}
+        </>
       )}
       <Text wrap="truncate-end">
         {lbl('LINKED')}
@@ -666,7 +675,16 @@ function ConfigView({
   scroll: number;
 }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
-  if (loading) return <Text color={theme.dim}>Loading config for {app.name}…</Text>;
+  if (loading) {
+    return (
+      <Box flexDirection="column">
+        <Text wrap="truncate-end">
+          <Text bold color={theme.accent}>{app.name}</Text>
+          <Text color={theme.dim}>{'  '}· loading config…</Text>
+        </Text>
+      </Box>
+    );
+  }
   const entries = Object.entries(config || {}).sort((a, b) => a[0].localeCompare(b[0]));
   const head = (
     <Text wrap="truncate-end">
@@ -1304,22 +1322,24 @@ export default function App(): ReactNode {
     };
   }, [wantDetail, currentApp, source, detailCache, dataV]);
 
-  // Layout sizing. One full-width bordered pane between header and footer.
-  // `colBudget` is the usable text width inside it (minus borders, padding and
-  // a safety margin so lines never soft-wrap). Vertically, per-app views split
-  // the pane: apps table on top, tab strip + spacer, then a fixed-height
-  // detail pane (~60%) so the split doesn't move when switching tabs.
+  // Layout sizing. Per-app views stack two bordered boxes between header and
+  // footer — the apps table on top, the tabbed detail pane below — so the two
+  // halves read as distinct panes. `colBudget` is the usable text width inside
+  // a box (minus borders, padding and a safety margin so lines never
+  // soft-wrap). The detail pane gets a fixed ~60% share so the split doesn't
+  // move when switching tabs.
   const colBudget = Math.max(20, columns - 7);
-  const inner = Math.max(8, rows - 4); // header + footer + pane borders
+  const inner = Math.max(10, rows - 2); // header + footer
   const stripRows = 2; // tab strip + the blank line under it
   const MIN_TABLE = 5; // column header + a few app rows
-  let detailViewport = Math.max(6, Math.floor((inner - stripRows) * 0.6));
-  if (inner - stripRows - detailViewport < MIN_TABLE) {
-    detailViewport = Math.max(3, inner - stripRows - MIN_TABLE);
+  const usable = Math.max(6, inner - 4 - stripRows); // minus both boxes' borders
+  let detailViewport = Math.max(6, Math.floor(usable * 0.6));
+  if (usable - detailViewport < MIN_TABLE) {
+    detailViewport = Math.max(3, usable - MIN_TABLE);
   }
-  const tableRows = Math.max(0, inner - stripRows - detailViewport);
-  const fullViewport = Math.max(3, inner - stripRows); // global views (no table)
-  const overlayViewport = Math.max(3, inner - 1); // help/command take the pane, minus a title row
+  const tableRows = Math.max(1, usable - detailViewport);
+  const fullViewport = Math.max(3, inner - 2 - stripRows); // global views: one box, no table
+  const overlayViewport = Math.max(3, inner - 2 - 1); // help/command take one box, minus a title row
 
   const clampScroll = useCallback((delta: number, total: number) => {
     setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - detailViewport)));
@@ -1625,31 +1645,39 @@ export default function App(): ReactNode {
         refreshing={refreshing && !loading}
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
-      <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
-        {overlayTitle ? (
-          <>
-            <Text wrap="truncate-end" color={theme.dim}>{overlayTitle}</Text>
+      {overlayTitle ? (
+        <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
+          <Text wrap="truncate-end" color={theme.dim}>{overlayTitle}</Text>
+          {content}
+        </Box>
+      ) : currentView.perApp ? (
+        <>
+          <Box
+            height={tableRows + 2}
+            flexShrink={0}
+            flexDirection="column"
+            overflow="hidden"
+            borderStyle="round"
+            borderColor={theme.dim}
+            paddingX={2}
+          >
+            <AppTable apps={apps} stats={statsMap} selected={selectedApp} height={tableRows} />
+          </Box>
+          <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
+            <TabBar view={view} columns={colBudget} filter={activeFilter} />
+            <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
+              {content}
+            </Box>
+          </Box>
+        </>
+      ) : (
+        <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
+          <TabBar view={view} columns={colBudget} filter={activeFilter} />
+          <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
             {content}
-          </>
-        ) : currentView.perApp ? (
-          <>
-            <Box height={tableRows} flexShrink={0} flexDirection="column" overflow="hidden">
-              <AppTable apps={apps} stats={statsMap} selected={selectedApp} height={tableRows} />
-            </Box>
-            <TabBar view={view} columns={colBudget} filter={activeFilter} />
-            <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
-              {content}
-            </Box>
-          </>
-        ) : (
-          <>
-            <TabBar view={view} columns={colBudget} filter={activeFilter} />
-            <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
-              {content}
-            </Box>
-          </>
-        )}
-      </Box>
+          </Box>
+        </Box>
+      )}
       {cmdInput !== null ? (
         <CommandBar text={cmdInput} app={currentApp?.name} />
       ) : filterInput !== null ? (

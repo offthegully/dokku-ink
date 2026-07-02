@@ -11,7 +11,8 @@ The dashboard views are **read-only** — they only observe. Anything that chang
 │ › blog       ● running  web×2 worker×1  2.8%   598M   LE ✔    blog.exam… +1 │
 │   api        ● running  web×3           14%    913M   LE ✔    api.example.… │
 │   staging    ○ stopped  web×1           —      —      none    staging.exam… │
-│                                                                             │
+╰─────────────────────────────────────────────────────────────────────────────╯
+╭─────────────────────────────────────────────────────────────────────────────╮
 │  1 Overview  2 Domains & SSL  3 Processes  4 Config / Env  5 Logs  6 Serv…  │
 │                                                                             │
 │  blog  ● running   cpu 2.8% · mem 598M                                      │
