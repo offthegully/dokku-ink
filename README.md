@@ -1,11 +1,11 @@
-# dokku-dash
+# dokku-ink
 
 A terminal dashboard and command cheat sheet for [Dokku](https://dokku.com/), built with [Ink](https://github.com/vadimdemedes/ink) and TypeScript. It runs **directly on your Dokku host** (or against one over SSH with `--ssh`) and gives you a Claude-Code-style TUI to see your apps, domains, SSL, processes, CPU/memory usage, config and datastore services at a glance — no web front-end to host, no service to expose.
 
 The dashboard views are **read-only** — they only observe. Anything that changes state goes through the explicit `:` command line (see below), so nothing mutates your server unless you typed it.
 
 ```
- dokku-dash · my-server                        ↻ 12s   disk 61%   5 apps   LIVE
+ dokku-ink · my-server                        ↻ 12s   disk 61%   5 apps   LIVE
 ╭─────────────────────────────────────────────────────────────────────────────╮
 │   NAME       STATUS     PROCESSES       CPU    MEM    SSL     DOMAIN        │
 │ › blog       ● running  web×2 worker×1  2.8%   598M   LE ✔    blog.exam… +1 │
@@ -34,51 +34,84 @@ Dokku doesn't ship an official open-source REST API (Dokku Pro has a paid one, a
 
 ## Requirements
 
-- Node.js 18+ on the Dokku host
 - The `dokku` command available on `PATH` for the user running the tool
+- **Nothing else** — the prebuilt binary is fully self-contained (no Node, no Bun, no runtime to install). Node.js 18+ is only needed if you run from source instead.
 
 Without Dokku present (e.g. on your laptop), it automatically runs with **demo data** so you can try the interface.
 
 ## Install
 
-```bash
-git clone <your-repo> dokku-dash
-cd dokku-dash
-npm install      # installs deps
-npm run build    # compiles TypeScript -> dist/
-```
-
-Then run it:
+The quickest way — a single self-contained binary, no Node or Bun required. This
+is the recommended path on a Dokku host:
 
 ```bash
-node dist/index.js     # or: npm start
+curl -fsSL https://raw.githubusercontent.com/offthegully/dokku-ink/main/install.sh | sh
 ```
 
-Optionally make it a global `dokku-dash` command:
+This detects your OS/arch (Linux or macOS, x64 or arm64), downloads the matching
+binary from the latest [GitHub Release](https://github.com/offthegully/dokku-ink/releases),
+and installs it to `/usr/local/bin/dokku-ink` (falling back to `~/.local/bin` if
+that isn't writable). Then just:
 
 ```bash
-npm link         # or: npm install -g .
-dokku-dash
+dokku-ink            # or: dokku-ink --demo   to preview without Dokku
 ```
+
+<details>
+<summary>Install options &amp; alternatives</summary>
+
+**Pin a version or change the install location:**
+
+```bash
+# install a specific release tag instead of latest
+curl -fsSL https://raw.githubusercontent.com/offthegully/dokku-ink/main/install.sh | DOKKU_INK_VERSION=v0.1.0 sh
+
+# install somewhere else (e.g. no root, no sudo)
+curl -fsSL https://raw.githubusercontent.com/offthegully/dokku-ink/main/install.sh | DOKKU_INK_INSTALL_DIR="$HOME/bin" sh
+```
+
+**Prefer to download the binary yourself?** Grab the asset for your platform
+(`dokku-ink-<os>-<arch>`) from the [Releases page](https://github.com/offthegully/dokku-ink/releases),
+`chmod +x` it, and drop it anywhere on your `PATH`.
+
+**Run from source** (needs Node 18+ or Bun) — best for hacking on it:
+
+```bash
+git clone https://github.com/offthegully/dokku-ink.git
+cd dokku-ink
+npm install
+npm run build          # compiles TypeScript -> dist/
+node dist/index.js     # or: npm start   ·   or: npm link  for a global `dokku-ink`
+```
+
+**Build the standalone binary yourself** (needs Bun):
+
+```bash
+bun install
+bun run build:binary       # -> ./build/dokku-ink for your current platform
+bun run build:binaries     # -> all four release binaries in ./build
+```
+
+</details>
 
 ## Usage
 
 ```bash
-dokku-dash                      # live dashboard (reads the local dokku CLI)
-dokku-dash --ssh dokku@my-host  # remote dashboard over SSH (see below)
-dokku-dash --demo               # sample data, no Dokku required
-dokku-dash --help
+dokku-ink                      # live dashboard (reads the local dokku CLI)
+dokku-ink --ssh dokku@my-host  # remote dashboard over SSH (see below)
+dokku-ink --demo               # sample data, no Dokku required
+dokku-ink --help
 ```
 
 ## Remote mode (SSH)
 
 You don't have to run it on the server. Point it at a host with `--ssh <dest>`
-(or `DOKKU_DASH_SSH=<dest>`) and every dokku invocation is executed remotely
+(or `DOKKU_INK_SSH=<dest>`) and every dokku invocation is executed remotely
 over a multiplexed SSH connection (one handshake, reused for all commands):
 
 ```bash
-dokku-dash --ssh dokku@my-host   # uses Dokku's own SSH user
-dokku-dash --ssh ubuntu@my-host  # any user that can run `dokku` (and docker)
+dokku-ink --ssh dokku@my-host   # uses Dokku's own SSH user
+dokku-ink --ssh ubuntu@my-host  # any user that can run `dokku` (and docker)
 ```
 
 Two flavours, one trade-off:
@@ -164,7 +197,7 @@ prints exactly what your Dokku returns for each command and whether the tool
 could parse it, without launching the TUI:
 
 ```bash
-dokku-dash --doctor
+dokku-ink --doctor
 # from source:  bun src/index.tsx --doctor   (or)   npx tsx src/index.tsx --doctor
 ```
 
@@ -177,11 +210,11 @@ with your Dokku version.
 
 | Env var             | Default    | Purpose                                  |
 | ------------------- | ---------- | ---------------------------------------- |
-| `DOKKU_DASH_BIN`    | `dokku`    | Path to the `dokku` binary               |
-| `DOKKU_DASH_SSH`    | –          | Remote target, same as `--ssh` (e.g. `dokku@my-host`) |
-| `DOKKU_DASH_HOST`   | hostname   | Label shown in the header                |
-| `DOKKU_DASH_DEMO`   | –          | Set to `1` to force demo data            |
-| `DOKKU_DASH_REFRESH`| `30`       | Auto-refresh interval in seconds (`0` disables) |
+| `DOKKU_INK_BIN`    | `dokku`    | Path to the `dokku` binary               |
+| `DOKKU_INK_SSH`    | –          | Remote target, same as `--ssh` (e.g. `dokku@my-host`) |
+| `DOKKU_INK_HOST`   | hostname   | Label shown in the header                |
+| `DOKKU_INK_DEMO`   | –          | Set to `1` to force demo data            |
+| `DOKKU_INK_REFRESH`| `30`       | Auto-refresh interval in seconds (`0` disables) |
 
 ## How it reads data
 
@@ -216,7 +249,7 @@ npm test           # unit + render tests (node:test)
 npm run build      # emit dist/
 ```
 
-Everything under `src/` is TypeScript; `dist/` holds the compiled output (git-ignored) and is what the `dokku-dash` bin runs.
+Everything under `src/` is TypeScript; `dist/` holds the compiled output (git-ignored) and is what the `dokku-ink` bin runs.
 
 Project layout:
 

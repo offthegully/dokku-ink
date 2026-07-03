@@ -1,4 +1,4 @@
-// Data layer for dokku-dash.
+// Data layer for dokku-ink.
 //
 // Strategy: this tool is meant to run *on the Dokku host*, so instead of
 // standing up a REST API we just shell out to the `dokku` binary and parse its
@@ -44,7 +44,7 @@ const execFileAsync = promisify(execFile);
 let _hasDokku: boolean | null = null;
 
 export async function hasDokku(): Promise<boolean> {
-  if (process.env.DOKKU_DASH_DEMO === "1") return false;
+  if (process.env.DOKKU_INK_DEMO === "1") return false;
   if (_hasDokku !== null) return _hasDokku;
   try {
     const inv = dokkuInvocation(["version"]);
@@ -837,7 +837,7 @@ export function watchEvents(
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostics: `dokku-dash --doctor`
+// Diagnostics: `dokku-ink --doctor`
 // ---------------------------------------------------------------------------
 
 const indent = (s: string) =>
@@ -850,11 +850,11 @@ const clip = (s: string, n = 500) =>
 
 export async function runDoctor(): Promise<string> {
   const L: string[] = [];
-  L.push("dokku-dash doctor");
-  L.push(`binary: ${DOKKU_BIN()}   (override with DOKKU_DASH_BIN)`);
+  L.push("dokku-ink doctor");
+  L.push(`binary: ${DOKKU_BIN()}   (override with DOKKU_INK_BIN)`);
   L.push(
     isRemote()
-      ? `target: ssh ${remoteLabel()}   (from DOKKU_DASH_SSH / --ssh)`
+      ? `target: ssh ${remoteLabel()}   (from DOKKU_INK_SSH / --ssh)`
       : "target: local",
   );
   L.push("");

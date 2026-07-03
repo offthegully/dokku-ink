@@ -5,9 +5,15 @@ import { createRequire } from 'node:module';
 import { render } from 'ink';
 import App from './App.js';
 
-// Works from both src/ (tsx/bun) and dist/ (compiled) — one level below the
-// package root either way.
-const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
+// The version is baked in at compile time for the standalone binary (see
+// scripts/build.ts, which replaces __DOKKU_INK_VERSION__ via --define). When
+// running from src/ (tsx/bun) or dist/ (node) that token is undefined, so we
+// fall back to reading package.json one level above the entry point.
+declare const __DOKKU_INK_VERSION__: string | undefined;
+const version =
+  typeof __DOKKU_INK_VERSION__ !== 'undefined'
+    ? __DOKKU_INK_VERSION__
+    : (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 
 const args = process.argv.slice(2);
 
@@ -16,7 +22,7 @@ if (args.includes('--help') || args.includes('-h')) {
   process.exit(0);
 }
 if (args.includes('--version') || args.includes('-v')) {
-  console.log(`dokku-dash ${version}`);
+  console.log(`dokku-ink ${version}`);
   process.exit(0);
 }
 // --ssh <dest> must land in the env before the first dokku call (the exec
@@ -28,7 +34,7 @@ if (sshIdx !== -1) {
     console.error('--ssh needs a destination, e.g. --ssh dokku@my-host');
     process.exit(1);
   }
-  process.env.DOKKU_DASH_SSH = dest;
+  process.env.DOKKU_INK_SSH = dest;
 }
 if (args.includes('--doctor') || args.includes('doctor')) {
   const { runDoctor } = await import('./dokku.js');
@@ -36,12 +42,12 @@ if (args.includes('--doctor') || args.includes('doctor')) {
   process.exit(0);
 }
 if (args.includes('--demo')) {
-  process.env.DOKKU_DASH_DEMO = '1';
+  process.env.DOKKU_INK_DEMO = '1';
 }
 
-if (!process.stdout.isTTY && process.env.DOKKU_DASH_DEMO !== '1') {
+if (!process.stdout.isTTY && process.env.DOKKU_INK_DEMO !== '1') {
   console.error(
-    'dokku-dash needs an interactive terminal. Try `dokku-dash --demo` to preview, or run it in a real TTY.',
+    'dokku-ink needs an interactive terminal. Try `dokku-ink --demo` to preview, or run it in a real TTY.',
   );
   process.exit(1);
 }
@@ -71,10 +77,10 @@ const { waitUntilExit } = render(<App />, { stdout: syncStdout, exitOnCtrlC: fal
 await waitUntilExit();
 
 function printHelp(): void {
-  console.log(`dokku-dash — a terminal dashboard & cheat sheet for Dokku
+  console.log(`dokku-ink — a terminal dashboard & cheat sheet for Dokku
 
 USAGE
-  dokku-dash [options]
+  dokku-ink [options]
 
 OPTIONS
   --demo         Show demo data (no Dokku required)
@@ -100,11 +106,11 @@ KEYS (inside the dashboard)
   q / Ctrl-C     Quit
 
 ENV
-  DOKKU_DASH_BIN      Path to the dokku binary (default: dokku)
-  DOKKU_DASH_SSH      Remote target, same as --ssh (e.g. dokku@my-host)
-  DOKKU_DASH_HOST     Label shown in the header (default: hostname)
-  DOKKU_DASH_DEMO     Set to 1 to force demo data
-  DOKKU_DASH_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
+  DOKKU_INK_BIN      Path to the dokku binary (default: dokku)
+  DOKKU_INK_SSH      Remote target, same as --ssh (e.g. dokku@my-host)
+  DOKKU_INK_HOST     Label shown in the header (default: hostname)
+  DOKKU_INK_DEMO     Set to 1 to force demo data
+  DOKKU_INK_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
 
 Run this on your Dokku host (or point --ssh at one); it shells out to
 the \`dokku\` CLI (read-only) — no REST API or extra services needed.`);

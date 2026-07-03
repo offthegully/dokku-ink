@@ -1,0 +1,43 @@
+name: release
+
+# Push a version tag to cut a release:
+#   npm version patch            # bumps package.json + creates the tag
+#   git push --follow-tags
+# Bun cross-compiles all four binaries from this single Linux runner and
+# attaches them to the GitHub Release that install.sh downloads from.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build binaries
+        run: bun run build:binaries
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            build/dokku-ink-linux-x64 \
+            build/dokku-ink-linux-arm64 \
+            build/dokku-ink-darwin-x64 \
+            build/dokku-ink-darwin-arm64

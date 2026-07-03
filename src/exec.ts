@@ -2,7 +2,7 @@
 //
 // Every dokku/docker call in the data layer goes through here, so the whole
 // dashboard can run either directly on the Dokku host or from a laptop with
-// DOKKU_DASH_SSH=<dest> (or --ssh <dest>) set:
+// DOKKU_INK_SSH=<dest> (or --ssh <dest>) set:
 //
 //   dokku@host  — Dokku's own SSH user. The server forces the `dokku` command,
 //                 so we send the subcommand words directly ("apps:list").
@@ -17,7 +17,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const DOKKU_BIN = () => process.env.DOKKU_DASH_BIN || "dokku";
+export const DOKKU_BIN = () => process.env.DOKKU_INK_BIN || "dokku";
 
 interface SshTarget {
   dest: string;
@@ -30,7 +30,7 @@ let _ssh: SshTarget | null | undefined;
 
 function sshTarget(): SshTarget | null {
   if (_ssh !== undefined) return _ssh;
-  const dest = process.env.DOKKU_DASH_SSH?.trim();
+  const dest = process.env.DOKKU_INK_SSH?.trim();
   _ssh = dest ? { dest, dokkuUser: dest.startsWith("dokku@") } : null;
   return _ssh;
 }
@@ -48,7 +48,7 @@ const sshOpts = () => [
   "-o", "BatchMode=yes",
   "-o", "ConnectTimeout=8",
   "-o", "ControlMaster=auto",
-  "-o", `ControlPath=${join(tmpdir(), "dokku-dash-%C")}`,
+  "-o", `ControlPath=${join(tmpdir(), "dokku-ink-%C")}`,
   "-o", "ControlPersist=120",
 ];
 

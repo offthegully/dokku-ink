@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-process.env.DOKKU_DASH_DEMO = '1';
+process.env.DOKKU_INK_DEMO = '1';
 
 const React = (await import('react')).default;
 const { render } = await import('ink-testing-library');
@@ -29,7 +29,7 @@ async function withApp(fn: (inst: Instance) => Promise<void>): Promise<void> {
 test('renders the dashboard with demo data', () =>
   withApp(async ({ lastFrame, stdin }) => {
     const frame = lastFrame() ?? '';
-    assert.match(frame, /dokku-dash/);
+    assert.match(frame, /dokku-ink/);
     assert.match(frame, /DEMO DATA/);
     assert.match(frame, /blog/); // first demo app
     assert.match(frame, /Cheats|Cheat Sheet/); // tab-bar label (short on narrow terms)

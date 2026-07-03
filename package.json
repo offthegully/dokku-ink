@@ -1,10 +1,18 @@
 {
-  "name": "dokku-dash",
+  "name": "dokku-ink",
   "version": "0.1.0",
   "description": "A terminal dashboard & cheat sheet for Dokku. Read-only visualizer that runs directly on your Dokku host.",
   "type": "module",
   "bin": {
-    "dokku-dash": "dist/index.js"
+    "dokku-ink": "dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/offthegully/dokku-ink.git"
+  },
+  "homepage": "https://github.com/offthegully/dokku-ink#readme",
+  "bugs": {
+    "url": "https://github.com/offthegully/dokku-ink/issues"
   },
   "files": [
     "dist",
@@ -12,6 +20,9 @@
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
+    "prepublishOnly": "npm run build",
+    "build:binary": "bun scripts/build.ts",
+    "build:binaries": "bun scripts/build-all.ts",
     "dev": "tsx src/index.tsx",
     "demo": "tsx src/index.tsx --demo",
     "dev:bun": "bun src/index.tsx",

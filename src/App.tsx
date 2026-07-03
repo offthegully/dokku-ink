@@ -1,4 +1,4 @@
-// Main TUI for dokku-dash: a read-only dashboard over a Dokku host plus a
+// Main TUI for dokku-ink: a read-only dashboard over a Dokku host plus a
 // built-in command cheat sheet.
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
@@ -67,10 +67,10 @@ const VIEWS: ViewDef[] = [
   { key: 'cheatsheet', label: 'Cheat Sheet', short: 'Cheats', perApp: false },
 ];
 
-// Auto-refresh cadence for overview data. Configurable via DOKKU_DASH_REFRESH
+// Auto-refresh cadence for overview data. Configurable via DOKKU_INK_REFRESH
 // (seconds); 0 disables polling.
 const REFRESH_SECONDS = (() => {
-  const raw = Number(process.env.DOKKU_DASH_REFRESH ?? 30);
+  const raw = Number(process.env.DOKKU_INK_REFRESH ?? 30);
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
 })();
 // The view you're staring at should feel closer to real time: while the
@@ -164,7 +164,7 @@ function Header({
     <Box justifyContent="space-between" paddingX={1}>
       <Box>
         <Text color={theme.accent} bold>
-          dokku-dash
+          dokku-ink
         </Text>
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
@@ -860,9 +860,9 @@ function HelpView(): ReactNode {
     ['r', 'refresh now (full report sweep)'],
     ['q / ctrl-c', 'quit'],
     null,
-    ['DOKKU_DASH_SSH', 'run remotely: dokku@host (dokku commands only) or user@host'],
-    ['DOKKU_DASH_REFRESH', 'poll seconds (default 30, 0 = off)'],
-    ['DOKKU_DASH_BIN', 'dokku binary path'],
+    ['DOKKU_INK_SSH', 'run remotely: dokku@host (dokku commands only) or user@host'],
+    ['DOKKU_INK_REFRESH', 'poll seconds (default 30, 0 = off)'],
+    ['DOKKU_INK_BIN', 'dokku binary path'],
     ['dokku events:on', 'enable push-based refresh on the host'],
   ];
   return (
@@ -1690,5 +1690,5 @@ export default function App(): ReactNode {
 }
 
 function hostLabel(): string {
-  return process.env.DOKKU_DASH_HOST || remoteLabel() || process.env.HOSTNAME || 'local';
+  return process.env.DOKKU_INK_HOST || remoteLabel() || process.env.HOSTNAME || 'local';
 }
