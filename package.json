@@ -1,6 +1,6 @@
 {
   "name": "dokku-ink",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A terminal dashboard & cheat sheet for Dokku. Read-only visualizer that runs directly on your Dokku host.",
   "type": "module",
   "bin": {
