@@ -7,7 +7,7 @@
 // fallbacks. When `dokku` is not on PATH (e.g. local dev), we transparently
 // fall back to rich demo data so every view is still explorable.
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { DEMO } from "./demo.js";
 import {
@@ -700,6 +700,30 @@ const sanitizeLine = (s: string) =>
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
     .replace(/\t/g, "  ");
 
+// Kill a spawned child and anything it forked. These children run tailing
+// commands (`dokku logs -t`, `dokku events -t`) whose underlying plugin
+// scripts commonly exec into a pipeline (e.g. `docker logs -f | ...`); a
+// plain `child.kill()` only signals the immediate process, orphaning that
+// pipeline. The orphan keeps holding the piped stdout open, so Node's event
+// loop never goes idle — the dashboard quits visually (Ink unmounts fine)
+// but the process itself hangs forever. Spawning with `detached: true`
+// makes the child its own process-group leader, so killing `-pid` reaches
+// the whole tree; destroying the streams is a backstop for anything left
+// holding the pipe regardless.
+function killTree(child: ChildProcess): void {
+  if (child.pid && process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      child.kill("SIGTERM");
+    }
+  } else {
+    child.kill("SIGTERM");
+  }
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
 // Feed a child stream to onLine one sanitized line at a time.
 function streamLines(
   stream: NodeJS.ReadableStream,
@@ -746,6 +770,7 @@ export function tailLogs(
   const inv = dokkuInvocation(["logs", app, "-t", "-n", "100"]);
   const child = spawn(inv.cmd, inv.argv, {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
   });
   streamLines(child.stdout, false, onLine);
   streamLines(child.stderr, true, onLine);
@@ -759,7 +784,7 @@ export function tailLogs(
   });
   return () => {
     stopped = true;
-    child.kill("SIGTERM");
+    killTree(child);
   };
 }
 
@@ -774,7 +799,10 @@ export function runCommand(
   onEnd: (msg: string, ok: boolean) => void,
 ): () => void {
   const inv = dokkuInvocation(args);
-  const child = spawn(inv.cmd, inv.argv, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(inv.cmd, inv.argv, {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+  });
   streamLines(child.stdout, false, onLine);
   streamLines(child.stderr, true, onLine);
 
@@ -795,7 +823,7 @@ export function runCommand(
   });
   return () => {
     stopped = true;
-    child.kill("SIGTERM");
+    killTree(child);
   };
 }
 
@@ -810,6 +838,7 @@ export function watchEvents(
   const inv = dokkuInvocation(["events", "-t"]);
   const child = spawn(inv.cmd, inv.argv, {
     stdio: ["ignore", "pipe", "ignore"],
+    detached: true,
   });
   let stopped = false;
   let buf = "";
@@ -832,7 +861,7 @@ export function watchEvents(
   child.on("exit", dead);
   return () => {
     stopped = true;
-    child.kill("SIGTERM");
+    killTree(child);
   };
 }
 
