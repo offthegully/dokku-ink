@@ -16,7 +16,9 @@ import {
 } from '../src/dokku.js';
 import {
   appUsage,
+  daysUntil,
   fmtAge,
+  fmtAgeDays,
   fmtBytes,
   fmtDate,
   fmtPct,
@@ -224,6 +226,13 @@ test('fmtDate accepts ISO strings and epoch seconds', () => {
   assert.equal(fmtDate('2026-06-28T21:14:00Z'), '2026-06-28');
   assert.equal(fmtDate('1730556060'), '2024-11-02'); // dokku created-at shape
   assert.equal(fmtDate(null), '—');
+});
+
+test('daysUntil / fmtAgeDays accept epoch seconds like fmtDate', () => {
+  const epoch = String(Math.floor((Date.now() - 20 * 86400000) / 1000)); // 20 days ago
+  assert.equal(daysUntil(epoch), -20);
+  assert.equal(fmtAgeDays(epoch), '20d'); // the apps-table AGE column
+  assert.equal(fmtAgeDays('not a date'), '—');
 });
 
 test('parseDatastorePlugins finds enabled datastore plugins', () => {

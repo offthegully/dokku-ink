@@ -19,14 +19,14 @@ The dashboard views are **read-only** — they only observe. Anything that chang
 │  DOMAINS  routing enabled              SSL CERTIFICATE                      │
 │   • blog.example.com  ✔ cert            Status: LE ✔ · expires 27d          │
 ╰─────────────────────────────────────────────────────────────────────────────╯
- 1-7 view  ←→ switch view  ↑↓ app  / filter  : command  r refresh  q quit
+ 1-6 view  ←→ switch view  ↑↓ app  / filter  : command  c cheats  q quit
 ```
 
-Every per-app view shares one layout: the apps table stays on top (`↑`/`↓`
-selects an app), and the pane below it shows the selected tab — Overview,
-Domains & SSL, Processes, Config or Logs — for that app. `←`/`→` or the number
-keys switch tabs. Services and the Cheat Sheet aren't app-specific, so they
-take the full pane.
+Every view shares one layout: a table on top (`↑`/`↓` selects a row) and the
+pane below it showing the selected tab's detail for that row. Tabs 1–5 keep
+the apps table on top; Services (6) swaps in the datastore services table
+instead. `←`/`→` or the number keys switch tabs. The command cheat sheet isn't
+live data, so it opens as an overlay (`c`) from any view.
 
 ## Why no REST API?
 
@@ -152,12 +152,12 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 
 | Key            | Action                                        |
 | -------------- | --------------------------------------------- |
-| `1`–`7`        | Jump to a view                                |
-| `↑` / `↓`      | Select the app in the table (move the cursor in Services / Cheat Sheet) |
+| `1`–`6`        | Jump to a view                                |
+| `↑` / `↓`      | Select the row in the top table (app, or service on tab 6) |
 | `←` / `→` (`h`/`l`), `tab` | Switch view                       |
 | `j` / `k`      | Scroll the detail pane (Logs scrollback, long Config lists) |
-| `enter`        | On the cheat sheet, insert the command into `:` |
-| `esc`          | Close help, cancel a prompt, kill a running command |
+| `c`            | Open the command cheat sheet overlay; `enter` inserts the selected command into `:` |
+| `esc`          | Close an overlay, cancel a prompt, kill a running command |
 | `/`            | Filter the app list (or the cheat sheet); `esc` clears |
 | `s`            | Reveal / hide secrets (Config values, service DSN) |
 | `R` / `S` / `B`| Prefill restart / stop / rebuild for the selected app (never auto-runs) |
@@ -173,8 +173,8 @@ misbehaves under Bun, the compiled `node dist/index.js` path is the fallback.
 - **Processes** — per-process scale and individual container statuses with per-container CPU/memory, plus restart policy.
 - **Config / Env** — environment variables per app. **Values are masked by default**; press `s` to reveal. Use with care — env vars often contain secrets.
 - **Logs** — live tail of `dokku logs <app> -t` for the selected app (last 500 lines kept; `j`/`k` for scrollback, stderr highlighted). Buffers are cached per app for 5 minutes, so switching apps or views and back keeps your history — the re-attach replay is deduped by timestamp instead of repeating.
-- **Services** — datastore services from the official plugin family (postgres, redis, mysql, mongo, …): status, version, and which apps each service is linked to. The selected service's DSN is masked until you press `s`.
-- **Cheat Sheet** — a filterable reference of the most useful `dokku` commands, grouped by area. `enter` inserts the selected command into the `:` prompt (with `<app>` pre-substituted as `$app`) so it doubles as a launcher.
+- **Services** — datastore services from the official plugin family (postgres, redis, mysql, mongo, …) in the top table; the pane below shows the selected service's status, version, exposed ports, DSN (masked until you press `s`) and linked apps with their run state.
+- **Cheat Sheet** (`c`, overlay) — a filterable reference of the most useful `dokku` commands, grouped by area. `enter` inserts the selected command into the `:` prompt (with `<app>` pre-substituted as `$app`) so it doubles as a launcher.
 
 The Overview tab's drill-in reports (`git:report`, `ports:report`,
 `storage:list`, `network:report`) are fetched lazily for whatever app is

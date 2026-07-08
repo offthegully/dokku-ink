@@ -28,11 +28,15 @@ export function padEnd(str: unknown, n: number): string {
 }
 
 // Accepts ISO strings and dokku's epoch-seconds report values ("1730556060").
+function parseDate(iso: string): Date {
+  const s = iso.trim();
+  return /^\d{9,12}$/.test(s) ? new Date(Number(s) * 1000) : new Date(s);
+}
+
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '—';
-  const s = String(iso).trim();
-  const d = /^\d{9,12}$/.test(s) ? new Date(Number(s) * 1000) : new Date(s);
-  if (Number.isNaN(d.getTime())) return s;
+  const d = parseDate(String(iso));
+  if (Number.isNaN(d.getTime())) return String(iso).trim();
   return d.toISOString().slice(0, 10);
 }
 
@@ -95,7 +99,7 @@ export function appUsage(
 
 export function daysUntil(iso: string | null | undefined): number | null {
   if (!iso) return null;
-  const d = new Date(iso);
+  const d = parseDate(String(iso));
   if (Number.isNaN(d.getTime())) return null;
   return Math.round((d.getTime() - Date.now()) / 86400000);
 }

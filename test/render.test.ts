@@ -32,13 +32,16 @@ test('renders the dashboard with demo data', () =>
     assert.match(frame, /dokku-ink/);
     assert.match(frame, /DEMO DATA/);
     assert.match(frame, /blog/); // first demo app
-    assert.match(frame, /Cheats|Cheat Sheet/); // tab-bar label (short on narrow terms)
+    assert.match(frame, /Services/); // tab-bar label
     assert.match(frame, /CPU/); // usage columns from demo docker stats
     assert.match(frame, /disk 61%/); // demo host disk in the header
 
-    stdin.write('7'); // Cheat Sheet view
+    stdin.write('c'); // Cheat Sheet overlay
     await tick(20);
+    assert.match(lastFrame() ?? '', /CHEAT SHEET/);
     assert.match(lastFrame() ?? '', /dokku apps:list|Deploy|Process/);
+    stdin.write(''); // esc closes the overlay
+    await tick(20);
 
     stdin.write('5'); // Logs view (demo generator)
     await tick(20);
@@ -50,9 +53,11 @@ test('services view lists demo datastores and masks the DSN', () =>
     stdin.write('6'); // Services view
     await tick(40); // let loadServices() resolve
     const frame = lastFrame() ?? '';
+    assert.match(frame, /PLUGIN/); // services table replaces the apps table on top
     assert.match(frame, /blog-db/);
     assert.match(frame, /postgres/);
     assert.match(frame, /api-cache/); // redis service listed too
+    assert.match(frame, /VERSION/); // selected service's detail pane below
     assert.doesNotMatch(frame, /s3cr3t/); // DSN masked by default
     stdin.write('s'); // reveal
     await tick(20);
@@ -116,13 +121,15 @@ test('`?` opens the help overlay', () =>
     assert.doesNotMatch(lastFrame() ?? '', /HELP/);
   }));
 
-test('cheat sheet enter prefills the `:` prompt', () =>
+test('cheat sheet enter prefills the `:` prompt and closes the overlay', () =>
   withApp(async ({ lastFrame, stdin }) => {
-    stdin.write('7'); // Cheat Sheet
+    stdin.write('c'); // Cheat Sheet overlay
     await tick(20);
     stdin.write('\r'); // first item: dokku apps:list
     await tick(20);
-    assert.match(lastFrame() ?? '', /: dokku apps:list/);
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /: dokku apps:list/);
+    assert.doesNotMatch(frame, /CHEAT SHEET/); // overlay closed on insert
   }));
 
 test('`:` opens the command bar and escape closes it', () =>

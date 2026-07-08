@@ -29,7 +29,6 @@ export const CHEATSHEET: CheatGroup[] = [
       ['dokku git:sync <app> <repo-url>', 'Pull code from a remote repo'],
       ['dokku git:from-image <app> <image>', 'Deploy from a Docker image'],
       ['dokku git:set <app> deploy-branch <br>', 'Change the deploy branch'],
-      ['dokku ps:rebuild <app>', 'Rebuild from the current source'],
       ['dokku build-env:set <app> <k>=<v>', 'Set a build-time env var'],
     ],
   },

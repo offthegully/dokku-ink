@@ -45,14 +45,15 @@ import type {
 } from './types.js';
 
 interface ViewDef {
-  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'services' | 'cheatsheet';
+  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'services';
   label: string;
   /** Compact label for the tab bar on narrow terminals. */
   short: string;
   /**
-   * Per-app views share one layout: the apps table on top (↑↓ selects), a tab
-   * strip, and a detail pane for the selected app below. Global views
-   * (Services, Cheat Sheet) take the whole pane instead.
+   * Every view shares one master-detail layout: a table on top (↑↓ selects),
+   * a tab strip, and a detail pane for the selection below. Per-app views put
+   * the apps table on top; Services swaps in the services table instead. The
+   * cheat sheet lives outside the strip as an overlay (`c`).
    */
   perApp: boolean;
 }
@@ -64,7 +65,6 @@ const VIEWS: ViewDef[] = [
   { key: 'config', label: 'Config / Env', short: 'Config', perApp: true },
   { key: 'logs', label: 'Logs', short: 'Logs', perApp: true },
   { key: 'services', label: 'Services', short: 'Services', perApp: false },
-  { key: 'cheatsheet', label: 'Cheat Sheet', short: 'Cheats', perApp: false },
 ];
 
 // Auto-refresh cadence for overview data. Configurable via DOKKU_INK_REFRESH
@@ -230,24 +230,32 @@ function TabBar({ view, columns, filter }: { view: number; columns: number; filt
   );
 }
 
-function Footer({ view, columns }: { view: number; columns: number }): ReactNode {
+function Footer({ view, columns, overlay }: { view: number; columns: number; overlay?: 'cheat' | null }): ReactNode {
   const v = VIEWS[view];
   // [key, label, priority] — on narrow terminals the lowest-priority hints are
   // dropped whole rather than letting the layout squeeze every label. `?` is
   // kept at all costs: it's how the remaining keys stay discoverable.
-  const keys: Array<[string, string, number]> = [
-    [`1-${VIEWS.length}`, 'view', 4],
-    ['←→', 'switch view', 3],
-    ['↑↓', v.perApp ? 'app' : 'move', 9],
-  ];
-  if (v.key === 'logs' || v.key === 'config') keys.push(['j/k', 'scroll', 6]);
-  if (v.key === 'cheatsheet') keys.push(['↵', 'insert cmd', 8]);
-  if (v.perApp || v.key === 'cheatsheet') keys.push(['/', 'filter', 5]);
-  if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
-  keys.push([':', 'command', 7]);
-  keys.push(['r', 'refresh', 2]);
-  keys.push(['?', 'help', 10]);
-  keys.push(['q', 'quit', 8]);
+  const keys: Array<[string, string, number]> = [];
+  if (overlay === 'cheat') {
+    keys.push(['↑↓', 'move', 9]);
+    keys.push(['↵', 'insert cmd', 8]);
+    keys.push(['/', 'filter', 5]);
+    keys.push([':', 'command', 7]);
+    keys.push(['esc/q', 'close', 10]);
+  } else {
+    keys.push([`1-${VIEWS.length}`, 'view', 4]);
+    keys.push(['←→', 'switch view', 3]);
+    keys.push(['↑↓', v.perApp ? 'app' : 'move', 9]);
+    if (v.key === 'logs' || v.key === 'config') keys.push(['j/k', 'scroll', 6]);
+    if (v.perApp) keys.push(['/', 'filter', 5]);
+    if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
+    if (v.perApp) keys.push(['R/S/B', 'actions', 4]);
+    keys.push([':', 'command', 7]);
+    keys.push(['c', 'cheats', 6]);
+    keys.push(['r', 'refresh', 2]);
+    keys.push(['?', 'help', 10]);
+    keys.push(['q', 'quit', 8]);
+  }
 
   const width = (k: string, label: string) => k.length + label.length + 3; // "k label  "
   let total = keys.reduce((s, [k, label]) => s + width(k, label), 0) + 2;
@@ -448,21 +456,25 @@ function AppTable({
           a.domains.length === 0 ? '—' : a.domains[0] + (a.domains.length > 1 ? ` +${a.domains.length - 1}` : '');
         const sb = sslBadge(a.ssl);
         const usage = appUsage(a, stats);
+        // The whole row inverts on selection so the scan line is unmissable;
+        // per-cell status colors only apply to unselected rows.
+        const cell = (color: string) =>
+          isSel ? { backgroundColor: theme.accent, color: 'black' } : { color };
         return (
           <Box key={a.name}>
             <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
-            <Text wrap="truncate-end" bold backgroundColor={isSel ? theme.accent : undefined} color={isSel ? 'black' : theme.text}>
+            <Text wrap="truncate-end" bold {...cell(theme.text)}>
               {padEnd(a.name, nameW)}
             </Text>
-            <Text wrap="truncate-end" color={rb.color}>{padEnd(rb.text, statusW)}</Text>
-            <Text wrap="truncate-end">{padEnd(proc, procW)}</Text>
-            <Text wrap="truncate-end" color={usage.cpu !== null && usage.cpu >= 80 ? theme.warn : theme.dim}>
+            <Text wrap="truncate-end" {...cell(rb.color)}>{padEnd(rb.text, statusW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.text)}>{padEnd(proc, procW)}</Text>
+            <Text wrap="truncate-end" {...cell(usage.cpu !== null && usage.cpu >= 80 ? theme.warn : theme.dim)}>
               {padEnd(fmtPct(usage.cpu), cpuW)}
             </Text>
-            <Text wrap="truncate-end" color={theme.dim}>{padEnd(fmtBytes(usage.mem), memW)}</Text>
-            <Text wrap="truncate-end" color={theme.dim}>{padEnd(fmtAgeDays(a.createdAt), ageW)}</Text>
-            <Text wrap="truncate-end" color={sb.color}>{padEnd(sb.text, sslW)}</Text>
-            <Text wrap="truncate-end" color={theme.dim}>{domain}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(fmtBytes(usage.mem), memW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(fmtAgeDays(a.createdAt), ageW)}</Text>
+            <Text wrap="truncate-end" {...cell(sb.color)}>{padEnd(sb.text, sslW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{domain}</Text>
           </Box>
         );
       })}
@@ -767,22 +779,71 @@ function LogsView({
   );
 }
 
-function ServicesView({
+function serviceStatusColor(status: string | null): string {
+  return status && /run/i.test(status) ? theme.good : status ? theme.bad : theme.dim;
+}
+
+// The Services view's master list — sits in the top box where the apps table
+// lives on per-app views, so switching to tab 6 keeps the same skeleton.
+function ServicesTable({
   services,
   loading,
   cursor,
-  reveal,
-  viewport,
+  height,
 }: {
   services: DokkuService[] | null;
   loading: boolean;
   cursor: number;
-  reveal: boolean;
-  viewport: number;
+  height: number;
 }): ReactNode {
   if (loading && !services) return <Text color={theme.dim}>Probing datastore plugins…</Text>;
   const list = services ?? [];
-  if (list.length === 0) {
+  if (list.length === 0) return <Text color={theme.dim}>No datastore services found.</Text>;
+  const pluginW = 12;
+  const nameW = Math.min(24, Math.max(6, ...list.map((s) => s.name.length)) + 2);
+  const statusW = 10;
+  const versionW = Math.min(28, Math.max(9, ...list.map((s) => (s.version ?? '—').length)) + 2);
+  const listRows = Math.max(1, height - 1 - (list.length > height - 1 ? 1 : 0));
+  const { start, items } = windowed(list, cursor, listRows);
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end" color={theme.dim}>
+        {'  ' + padEnd('PLUGIN', pluginW) + padEnd('NAME', nameW) + padEnd('STATUS', statusW) + padEnd('VERSION', versionW) + 'LINKED APPS'}
+      </Text>
+      {items.map((s, i) => {
+        const isSel = start + i === cursor;
+        const cell = (color: string) =>
+          isSel ? { backgroundColor: theme.accent, color: 'black' } : { color };
+        return (
+          <Box key={`${s.plugin}/${s.name}`}>
+            <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(s.plugin, pluginW)}</Text>
+            <Text wrap="truncate-end" bold {...cell(theme.text)}>
+              {padEnd(s.name, nameW)}
+            </Text>
+            <Text wrap="truncate-end" {...cell(serviceStatusColor(s.status))}>{padEnd(s.status ?? '?', statusW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(s.version ?? '—', versionW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.text)}>{s.links.join(' ') || '—'}</Text>
+          </Box>
+        );
+      })}
+      {windowHint(list.length, start, items.length)}
+    </Box>
+  );
+}
+
+// The Services view's detail pane: everything about the selected service,
+// mirroring the labeled-rows shape of the app Overview pane.
+function ServiceDetail({
+  service,
+  apps,
+  reveal,
+}: {
+  service?: DokkuService;
+  apps: DokkuApp[];
+  reveal: boolean;
+}): ReactNode {
+  if (!service) {
     return (
       <Box flexDirection="column">
         <Text color={theme.dim}>No datastore services found.</Text>
@@ -795,63 +856,63 @@ function ServicesView({
       </Box>
     );
   }
-  const pluginW = 12;
-  const nameW = Math.min(24, Math.max(6, ...list.map((s) => s.name.length)) + 2);
-  const statusW = 10;
-  const versionW = 20;
-  const listRows = Math.max(3, viewport - 7);
-  const { start, items } = windowed(list, cursor, listRows);
-  const sel = list[cursor];
+  const lbl = (t: string) => <Text color={theme.dim}>{padEnd(t, 9)}</Text>;
   return (
     <Box flexDirection="column">
-      <Text wrap="truncate-end" color={theme.dim}>
-        {'  ' + padEnd('PLUGIN', pluginW) + padEnd('NAME', nameW) + padEnd('STATUS', statusW) + padEnd('VERSION', versionW) + 'LINKED APPS'}
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {service.plugin}/{service.name}
+        </Text>
+        {'  '}
+        <Text color={serviceStatusColor(service.status)}>● {service.status ?? 'unknown'}</Text>
       </Text>
-      {items.map((s, i) => {
-        const isSel = start + i === cursor;
-        const stColor = s.status && /run/i.test(s.status) ? theme.good : s.status ? theme.bad : theme.dim;
-        return (
-          <Box key={`${s.plugin}/${s.name}`}>
-            <Text color={theme.accent}>{isSel ? '› ' : '  '}</Text>
-            <Text wrap="truncate-end" color={theme.dim}>{padEnd(s.plugin, pluginW)}</Text>
-            <Text wrap="truncate-end" bold backgroundColor={isSel ? theme.accent : undefined} color={isSel ? 'black' : theme.text}>
-              {padEnd(s.name, nameW)}
-            </Text>
-            <Text wrap="truncate-end" color={stColor}>{padEnd(s.status ?? '?', statusW)}</Text>
-            <Text wrap="truncate-end" color={theme.dim}>{padEnd(s.version ?? '—', versionW)}</Text>
-            <Text wrap="truncate-end">{s.links.join(' ') || '—'}</Text>
-          </Box>
-        );
-      })}
-      {windowHint(list.length, start, items.length)}
-      {sel ? (
-        <>
-          <Text> </Text>
-          <Text wrap="truncate-end" bold color={theme.accent}>
-            {sel.plugin}/{sel.name}
-          </Text>
-          {sel.exposedPorts ? <Text wrap="truncate-end"> Exposed: {sel.exposedPorts}</Text> : null}
-          <Text wrap="truncate-end">
-            {' '}DSN: {sel.dsn ? (
-              <Text color={reveal ? theme.text : theme.dim}>{reveal ? sel.dsn : '•'.repeat(12) + '  (s to reveal)'}</Text>
-            ) : (
-              <Text color={theme.dim}>—</Text>
-            )}
-          </Text>
-        </>
-      ) : null}
+      <Text> </Text>
+      <Text wrap="truncate-end">
+        {lbl('VERSION')}
+        {service.version ?? <Text color={theme.dim}>—</Text>}
+      </Text>
+      <Text wrap="truncate-end">
+        {lbl('EXPOSED')}
+        {service.exposedPorts ?? <Text color={theme.dim}>(not exposed)</Text>}
+      </Text>
+      <Text wrap="truncate-end">
+        {lbl('DSN')}
+        {service.dsn ? (
+          <Text color={reveal ? theme.text : theme.dim}>{reveal ? service.dsn : '•'.repeat(12) + '  (s to reveal)'}</Text>
+        ) : (
+          <Text color={theme.dim}>—</Text>
+        )}
+      </Text>
+      <Text wrap="truncate-end">
+        {lbl('LINKED')}
+        {service.links.length === 0 ? (
+          <Text color={theme.dim}>(no linked apps)</Text>
+        ) : (
+          service.links.map((name, i) => {
+            const app = apps.find((a) => a.name === name);
+            const rb = app ? runningBadge(app) : null;
+            return (
+              <Text key={name}>
+                {i > 0 ? ' · ' : ''}
+                {name}
+                {rb ? <Text color={rb.color}> {rb.text}</Text> : null}
+              </Text>
+            );
+          })
+        )}
+      </Text>
     </Box>
   );
 }
 
 function HelpView(): ReactNode {
   const rows: Array<[string, string] | null> = [
-    ['1-7', 'jump to a view'],
+    [`1-${VIEWS.length}`, 'jump to a view'],
     ['←→ / hl / tab', 'next / previous view'],
     ['↑↓', 'select app · move in lists'],
     ['j / k', 'scroll the detail pane (logs, config)'],
-    ['enter', 'insert cheat-sheet command into the `:` prompt'],
-    ['esc', 'close help · cancel prompt · kill running command'],
+    ['c', 'open the command cheat sheet (enter inserts into `:`)'],
+    ['esc', 'close overlay · cancel prompt · kill running command'],
     ['/', 'filter the app list (or cheat sheet) · esc clears'],
     ['s', 'reveal/hide secrets (Config values, service DSN)'],
     null,
@@ -967,8 +1028,14 @@ function CheatsheetView({
 }): ReactNode {
   const lines = cheatLines(filter);
   if (lines.length === 0) return <Text color={theme.dim}>No commands match “{filter}”.</Text>;
-  const cmdW = Math.min(44, Math.max(22, Math.floor(width * 0.5)));
-  const { start, items } = windowed(lines, Math.min(cursor, lines.length - 1), viewport);
+  // Hug the longest visible command (filtering tightens the column) instead of
+  // always claiming half the screen and stranding the descriptions far right.
+  const longest = lines.reduce((m, l) => (l.type === 'item' ? Math.max(m, l.cmd.length) : m), 0);
+  const cmdW = Math.max(22, Math.min(44, longest + 1, Math.floor(width * 0.6)));
+  // One row stays reserved for the window hint — overflowing the box makes
+  // Yoga squeeze the column and collapse arbitrary rows instead of clipping.
+  const rows = Math.max(3, viewport - (lines.length > viewport - 1 ? 1 : 0));
+  const { start, items } = windowed(lines, Math.min(cursor, lines.length - 1), rows);
   return (
     <Box flexDirection="column">
       {items.map((l, i) => {
@@ -987,7 +1054,9 @@ function CheatsheetView({
             <Text wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.good}>
               {padEnd(truncate(l.cmd, cmdW), cmdW)}
             </Text>
-            <Text wrap="truncate-end" color={theme.dim}> {l.desc}</Text>
+            <Text wrap="truncate-end" backgroundColor={sel ? theme.accent : undefined} color={sel ? 'black' : theme.dim}>
+              {' '}{l.desc}
+            </Text>
           </Box>
         );
       })}
@@ -1029,6 +1098,7 @@ export default function App(): ReactNode {
   const [svcReveal, setSvcReveal] = useState(false);
   const [svcCursor, setSvcCursor] = useState(0);
   const [cheatCursor, setCheatCursor] = useState(1); // first item under first group
+  const [cheatOpen, setCheatOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
   const [data, setData] = useState<Overview | null>(null);
@@ -1067,7 +1137,7 @@ export default function App(): ReactNode {
   const currentView = VIEWS[view];
   const source: Source = data ? data.source : 'demo';
 
-  const filterTarget: 'apps' | 'cheat' = currentView.key === 'cheatsheet' ? 'cheat' : 'apps';
+  const filterTarget: 'apps' | 'cheat' = cheatOpen ? 'cheat' : 'apps';
   const appFilterLive = filterInput !== null && filterTarget === 'apps' ? filterInput : appFilter;
   const cheatFilterLive = filterInput !== null && filterTarget === 'cheat' ? filterInput : cheatFilter;
 
@@ -1209,12 +1279,12 @@ export default function App(): ReactNode {
 
   // Keep the cheat-sheet cursor parked on an item row when the filter changes.
   useEffect(() => {
-    if (currentView.key !== 'cheatsheet') return;
+    if (!cheatOpen) return;
     const lines = cheatLines(cheatFilterLive);
     if (lines[cheatCursor]?.type === 'item') return;
     const first = lines.findIndex((l) => l.type === 'item');
     if (first !== -1) setCheatCursor(first);
-  }, [currentView.key, cheatFilterLive, cheatCursor]);
+  }, [cheatOpen, cheatFilterLive, cheatCursor]);
 
   // Tail logs while the Logs view is showing an app. Lines are buffered and
   // flushed on an interval so a chatty app doesn't re-render per line.
@@ -1322,24 +1392,23 @@ export default function App(): ReactNode {
     };
   }, [wantDetail, currentApp, source, detailCache, dataV]);
 
-  // Layout sizing. Per-app views stack two bordered boxes between header and
-  // footer — the apps table on top, the tabbed detail pane below — so the two
-  // halves read as distinct panes. `colBudget` is the usable text width inside
-  // a box (minus borders, padding and a safety margin so lines never
-  // soft-wrap). The detail pane gets a fixed ~60% share so the split doesn't
-  // move when switching tabs.
+  // Layout sizing. Every view stacks two bordered boxes between header and
+  // footer — the master table on top (apps, or services on tab 6), the tabbed
+  // detail pane below — so the two halves read as distinct panes. `colBudget`
+  // is the usable text width inside a box (minus borders, padding and a safety
+  // margin so lines never soft-wrap). The top box hugs its list (header + one
+  // row per entry, capped at half the height) instead of claiming a fixed
+  // share — short lists stop stranding blank rows, and the split stays put
+  // while flipping tabs because it depends only on the unfiltered list length.
   const colBudget = Math.max(20, columns - 7);
   const inner = Math.max(10, rows - 2); // header + footer
   const stripRows = 2; // tab strip + the blank line under it
-  const MIN_TABLE = 5; // column header + a few app rows
   const usable = Math.max(6, inner - 4 - stripRows); // minus both boxes' borders
-  let detailViewport = Math.max(6, Math.floor(usable * 0.6));
-  if (usable - detailViewport < MIN_TABLE) {
-    detailViewport = Math.max(3, usable - MIN_TABLE);
-  }
-  const tableRows = Math.max(1, usable - detailViewport);
-  const fullViewport = Math.max(3, inner - 2 - stripRows); // global views: one box, no table
-  const overlayViewport = Math.max(3, inner - 2 - 1); // help/command take one box, minus a title row
+  const masterCount = currentView.key === 'services' ? Math.max(1, services?.list.length ?? 1) : allApps.length;
+  const maxTable = Math.max(3, Math.floor(usable / 2));
+  const tableRows = Math.min(Math.max(2, masterCount + 1), maxTable);
+  const detailViewport = Math.max(3, usable - tableRows);
+  const overlayViewport = Math.max(3, inner - 2 - 1); // help/command/cheats take one box, minus a title row
 
   const clampScroll = useCallback((delta: number, total: number) => {
     setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - detailViewport)));
@@ -1444,6 +1513,46 @@ export default function App(): ReactNode {
       return;
     }
 
+    // Cheat sheet overlay: browse (↑↓/jk), filter (/), insert into `:` (enter).
+    if (cheatOpen) {
+      if (key.escape || input === 'q' || input === 'c') {
+        setCheatOpen(false);
+        return;
+      }
+      if (input === ':') {
+        setCmdInput('');
+        return;
+      }
+      if (input === '/') {
+        setFilterInput(cheatFilter);
+        return;
+      }
+      if (key.return) {
+        const lines = cheatLines(cheatFilterLive);
+        const line = lines[cheatCursor];
+        if (line?.type === 'item') {
+          const cmd = cheatToCommand(line.cmd);
+          if (cmd) {
+            setCheatOpen(false); // land back on the view with the prompt filled
+            setCmdInput(cmd);
+          }
+        }
+        return;
+      }
+      const up = key.upArrow || input === 'k';
+      const down = key.downArrow || input === 'j';
+      if (up || down) {
+        const delta = up ? -1 : 1;
+        const lines = cheatLines(cheatFilterLive);
+        setCheatCursor((c) => {
+          let i = c + delta;
+          while (i >= 0 && i < lines.length && lines[i].type !== 'item') i += delta;
+          return i >= 0 && i < lines.length ? i : c;
+        });
+      }
+      return;
+    }
+
     if (input === 'q') {
       exit();
       return;
@@ -1456,8 +1565,12 @@ export default function App(): ReactNode {
       setHelpOpen(true);
       return;
     }
-    if (input === '/' && (currentView.perApp || currentView.key === 'cheatsheet')) {
-      setFilterInput(filterTarget === 'cheat' ? cheatFilter : appFilter);
+    if (input === 'c') {
+      setCheatOpen(true);
+      return;
+    }
+    if (input === '/' && currentView.perApp) {
+      setFilterInput(appFilter);
       return;
     }
     if (input >= '1' && input <= String(VIEWS.length)) {
@@ -1481,18 +1594,6 @@ export default function App(): ReactNode {
       return;
     }
     if (currentView.perApp && quickAction(input)) return;
-
-    if (key.return) {
-      if (currentView.key === 'cheatsheet') {
-        const lines = cheatLines(cheatFilterLive);
-        const line = lines[cheatCursor];
-        if (line?.type === 'item') {
-          const cmd = cheatToCommand(line.cmd);
-          if (cmd) setCmdInput(cmd);
-        }
-      }
-      return;
-    }
 
     // ←/→ (h/l) steps through the detail tabs, wrapping like tab does.
     const left = key.leftArrow || input === 'h';
@@ -1528,21 +1629,12 @@ export default function App(): ReactNode {
       return;
     }
 
-    // Global list views: arrows and j/k both move the cursor.
+    // Services view: arrows and j/k both move the service cursor.
     if (!up && !down && !scrollUp && !scrollDown) return;
     const delta = up || scrollUp ? -1 : 1;
     if (currentView.key === 'services') {
       const total = services?.list.length ?? 0;
       setSvcCursor((i) => Math.min(Math.max(0, i + delta), Math.max(0, total - 1)));
-      return;
-    }
-    if (currentView.key === 'cheatsheet') {
-      const lines = cheatLines(cheatFilterLive);
-      setCheatCursor((c) => {
-        let i = c + delta;
-        while (i >= 0 && i < lines.length && lines[i].type !== 'item') i += delta;
-        return i >= 0 && i < lines.length ? i : c;
-      });
     }
   });
 
@@ -1593,31 +1685,32 @@ export default function App(): ReactNode {
       break;
     case 'services':
       content = (
-        <ServicesView
-          services={services?.list ?? null}
-          loading={servicesLoading}
-          cursor={svcCursor}
+        <ServiceDetail
+          service={services?.list[svcCursor]}
+          apps={allApps}
           reveal={svcReveal}
-          viewport={fullViewport}
-        />
-      );
-      break;
-    case 'cheatsheet':
-      content = (
-        <CheatsheetView
-          width={colBudget}
-          viewport={fullViewport}
-          cursor={cheatCursor}
-          filter={cheatFilterLive}
         />
       );
       break;
   }
   // Overlays take over the whole pane until dismissed.
   let overlayTitle: string | null = null;
+  let overlayFilter = '';
   if (helpOpen) {
     overlayTitle = 'HELP';
     content = <HelpView />;
+  }
+  if (cheatOpen) {
+    overlayTitle = 'CHEAT SHEET';
+    overlayFilter = cheatFilterLive;
+    content = (
+      <CheatsheetView
+        width={colBudget}
+        viewport={overlayViewport}
+        cursor={cheatCursor}
+        filter={cheatFilterLive}
+      />
+    );
   }
   if (cmdRun) {
     overlayTitle = 'COMMAND';
@@ -1633,7 +1726,20 @@ export default function App(): ReactNode {
     );
   }
 
-  const activeFilter = currentView.key === 'cheatsheet' ? cheatFilterLive : appFilterLive;
+  // The master table on top: apps for per-app views, services on tab 6.
+  const master =
+    currentView.key === 'services' ? (
+      <ServicesTable
+        services={services?.list ?? null}
+        loading={servicesLoading}
+        cursor={svcCursor}
+        height={tableRows}
+      />
+    ) : (
+      <AppTable apps={apps} stats={statsMap} selected={selectedApp} height={tableRows} />
+    );
+
+  const activeFilter = currentView.perApp ? appFilterLive : '';
   return (
     <Box flexDirection="column" height={rows}>
       <Header
@@ -1646,11 +1752,14 @@ export default function App(): ReactNode {
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
       />
       {overlayTitle ? (
-        <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
-          <Text wrap="truncate-end" color={theme.dim}>{overlayTitle}</Text>
+        <Box flexGrow={1} flexDirection="column" overflow="hidden" borderStyle="round" borderColor={theme.dim} paddingX={2}>
+          <Text wrap="truncate-end" color={theme.dim}>
+            {overlayTitle}
+            {overlayFilter ? <Text color={theme.warn}>  /{overlayFilter}</Text> : null}
+          </Text>
           {content}
         </Box>
-      ) : currentView.perApp ? (
+      ) : (
         <>
           <Box
             height={tableRows + 2}
@@ -1661,7 +1770,7 @@ export default function App(): ReactNode {
             borderColor={theme.dim}
             paddingX={2}
           >
-            <AppTable apps={apps} stats={statsMap} selected={selectedApp} height={tableRows} />
+            {master}
           </Box>
           <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
             <TabBar view={view} columns={colBudget} filter={activeFilter} />
@@ -1670,20 +1779,13 @@ export default function App(): ReactNode {
             </Box>
           </Box>
         </>
-      ) : (
-        <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={theme.dim} paddingX={2}>
-          <TabBar view={view} columns={colBudget} filter={activeFilter} />
-          <Box flexGrow={1} flexDirection="column" overflow="hidden" marginTop={1}>
-            {content}
-          </Box>
-        </Box>
       )}
       {cmdInput !== null ? (
         <CommandBar text={cmdInput} app={currentApp?.name} />
       ) : filterInput !== null ? (
         <FilterBar text={filterInput} target={filterTarget === 'cheat' ? 'cheat sheet' : 'apps'} />
       ) : (
-        <Footer view={view} columns={columns} />
+        <Footer view={view} columns={columns} overlay={cheatOpen && !cmdRun && !helpOpen ? 'cheat' : null} />
       )}
     </Box>
   );
