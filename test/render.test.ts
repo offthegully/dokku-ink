@@ -43,14 +43,14 @@ test('renders the dashboard with demo data', () =>
     stdin.write(''); // esc closes the overlay
     await tick(20);
 
-    stdin.write('5'); // Logs view (demo generator)
+    stdin.write('4'); // Logs view (demo generator)
     await tick(20);
     assert.match(lastFrame() ?? '', /dokku logs -t/);
   }));
 
 test('services view lists demo datastores and masks the DSN', () =>
   withApp(async ({ lastFrame, stdin }) => {
-    stdin.write('6'); // Services view
+    stdin.write('5'); // Services view
     await tick(40); // let loadServices() resolve
     const frame = lastFrame() ?? '';
     assert.match(frame, /PLUGIN/); // services table replaces the apps table on top
@@ -65,7 +65,7 @@ test('services view lists demo datastores and masks the DSN', () =>
   }));
 
 test('apps view auto-loads the selected app summary pane', () =>
-  withApp(async ({ lastFrame }) => {
+  withApp(async ({ lastFrame, frames }) => {
     await tick(300); // debounce + loadAppDetail() for the selected row
     const frame = lastFrame() ?? '';
     assert.match(frame, /GIT/);
@@ -73,6 +73,13 @@ test('apps view auto-loads the selected app summary pane', () =>
     assert.match(frame, /http:80:5000/);
     assert.match(frame, /STORAGE/);
     assert.match(frame, /blog-db/); // linked service in the summary
+    // Domains + SSL are merged into the Overview pane. Assert across the
+    // accumulated frames, not just the last write: ink-testing-library's
+    // captured frames can drop or overlay individual rows (a capture artifact
+    // — real terminals render correctly; see also the release.1 note below).
+    const all = frames.join('\n');
+    assert.match(all, /blog\.example\.com {2}✓ cert/);
+    assert.match(all, /SSL {6}LE ✓ · Let's Encrypt · expires 2026-07-30/);
   }));
 
 test('tab cycles to the next view', () =>
@@ -80,18 +87,22 @@ test('tab cycles to the next view', () =>
     stdin.write('\t');
     await tick(20);
     const frame = lastFrame() ?? '';
-    assert.match(frame, /SSL CERTIFICATE/); // Domains detail in the bottom pane
+    assert.match(frame, /PROCESSES/); // Processes detail in the bottom pane
+    assert.match(frame, /DEPLOY/);
     assert.match(frame, /NAME.*STATUS.*PROCESSES/); // apps table stays on top
   }));
 
 test('←/→ switches the detail tab and ↑↓ still selects the app', () =>
   withApp(async ({ lastFrame, stdin }) => {
-    stdin.write('[C'); // → to Domains & SSL
+    stdin.write('[C'); // → to Processes
     await tick(20);
-    assert.match(lastFrame() ?? '', /SSL CERTIFICATE/);
+    assert.match(lastFrame() ?? '', /DEPLOY/);
     stdin.write('[B'); // ↓ selects the next app in the table
     await tick(20);
-    assert.match(lastFrame() ?? '', /api {2}● running/); // detail follows the selection
+    // `release.1` only exists in api's process list — proves the detail pane
+    // followed the selection. (Don't assert on the bold header line: lastFrame
+    // can capture an incremental diff write that mangles leading bold chars.)
+    assert.match(lastFrame() ?? '', /release\.1/);
     stdin.write('[D'); // ← back to Overview
     await tick(300); // debounce + loadAppDetail()
     assert.match(lastFrame() ?? '', /GIT/);
@@ -244,7 +255,7 @@ test('confirm guard cannot be bypassed by a `dokku ` prefix, different casing, o
 
 test('config view masks values until revealed', () =>
   withApp(async ({ lastFrame, stdin }) => {
-    stdin.write('4'); // Config / Env view
+    stdin.write('3'); // Config / Env view
     await tick(40);
     assert.match(lastFrame() ?? '', /reveal/); // hint shown, values masked
     stdin.write('s'); // reveal

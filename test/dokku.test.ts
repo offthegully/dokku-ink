@@ -138,7 +138,7 @@ test('badges classify state correctly', () => {
 
   assert.match(
     sslBadge({ enabled: true, issuer: "Let's Encrypt", hostnames: [], startsAt: null, verified: true, expiresAt: '2099-01-01' }).text,
-    /✔/,
+    /✓/,
   );
   assert.equal(sslBadge(null).text, 'none');
   assert.equal(

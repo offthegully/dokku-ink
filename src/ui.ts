@@ -27,6 +27,12 @@ export function padEnd(str: unknown, n: number): string {
   return truncate(str, n).padEnd(n);
 }
 
+// Right-align within `n` columns, keeping a 2-space gutter before the next
+// column — for numeric table cells (CPU/MEM/AGE) so magnitudes line up.
+export function padNum(str: unknown, n: number): string {
+  return truncate(str, Math.max(0, n - 2)).padStart(Math.max(0, n - 2)).padEnd(n);
+}
+
 // Accepts ISO strings and dokku's epoch-seconds report values ("1730556060").
 function parseDate(iso: string): Date {
   const s = iso.trim();
@@ -120,7 +126,19 @@ export function sslBadge(ssl: Ssl | null | undefined): Badge {
   const issuer = ssl.issuer && /let'?s\s*encrypt/i.test(ssl.issuer) ? 'LE' : 'SSL';
   if (days !== null && days < 0) return { text: `${issuer} expired`, color: theme.bad };
   if (days !== null && days <= 14) return { text: `${issuer} ${days}d left`, color: theme.warn };
-  return { text: `${issuer} ✔`, color: theme.good };
+  // U+2713, not U+2714: string-width (what Ink measures layout with) counts
+  // the heavy checkmark as 2 columns, which shifts every cell after it.
+  return { text: `${issuer} ✓`, color: theme.good };
+}
+
+// Certificate issuers arrive as raw openssl DNs ("C = US, O = Let's Encrypt,
+// CN = YE2"); pull out the org and CN so the UI can say "Let's Encrypt (YE2)".
+export function fmtIssuer(issuer: string): string {
+  const field = (k: string) => new RegExp(`(?:^|,)\\s*${k}\\s*=\\s*([^,]+)`).exec(issuer)?.[1]?.trim();
+  const o = field('O');
+  const cn = field('CN');
+  if (o) return cn ? `${o} (${cn})` : o;
+  return cn ?? issuer;
 }
 
 // The app whose SSL certificate expires soonest — surfaced in the header so

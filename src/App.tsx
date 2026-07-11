@@ -7,10 +7,12 @@ import {
   theme,
   truncate,
   padEnd,
+  padNum,
   fmtAge,
   fmtAgeDays,
   fmtBytes,
   fmtDate,
+  fmtIssuer,
   fmtPct,
   appUsage,
   daysUntil,
@@ -46,7 +48,7 @@ import type {
 } from './types.js';
 
 interface ViewDef {
-  key: 'apps' | 'domains' | 'process' | 'config' | 'logs' | 'services';
+  key: 'apps' | 'process' | 'config' | 'logs' | 'services';
   label: string;
   /** Compact label for the tab bar on narrow terminals. */
   short: string;
@@ -61,7 +63,6 @@ interface ViewDef {
 
 const VIEWS: ViewDef[] = [
   { key: 'apps', label: 'Overview', short: 'Info', perApp: true },
-  { key: 'domains', label: 'Domains & SSL', short: 'Domains', perApp: true },
   { key: 'process', label: 'Processes', short: 'Procs', perApp: true },
   { key: 'config', label: 'Config / Env', short: 'Config', perApp: true },
   { key: 'logs', label: 'Logs', short: 'Logs', perApp: true },
@@ -381,29 +382,29 @@ function FilterBar({ text, target }: { text: string; target: string }): ReactNod
 // ---------------------------------------------------------------------------
 
 // The Overview tab's detail pane: a compact drill-in for the selected app.
+// Config/runtime facts fill the left column; domains and the SSL certificate
+// fill the right one (stacked vertically on narrow terminals).
 function AppSummary({
   app,
   detail,
   loading,
   services,
+  width,
 }: {
   app: DokkuApp;
   detail?: AppDetail;
   loading: boolean;
   services: DokkuService[] | null;
+  width: number;
 }): ReactNode {
   const linked = (services ?? []).filter((s) => s.links.includes(app.name));
   const lbl = (t: string) => <Text color={theme.dim}>{padEnd(t, 9)}</Text>;
-  return (
-    <Box flexDirection="column">
-      <Text wrap="truncate-end">
-        <Text bold color={theme.accent}>
-          {app.name}
-        </Text>
-        <Text color={theme.dim}>
-          {'  '}created {fmtDate(app.createdAt)} · deploy {app.deploySource || '—'} · restart {app.restartPolicy || '—'}
-        </Text>
-      </Text>
+  const sb = sslBadge(app.ssl);
+  const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
+  const stacked = width < 90;
+  const leftW = Math.min(72, Math.max(36, Math.floor(width * 0.5)));
+  const left = (
+    <>
       {detail ? (
         <>
           <Text wrap="truncate-end">
@@ -459,6 +460,78 @@ function AppSummary({
           ))
         )}
       </Text>
+    </>
+  );
+  const right = (
+    <>
+      <Text wrap="truncate-end">
+        {lbl('DOMAINS')}
+        {app.domainsEnabled === false ? (
+          <Text color={theme.warn}>routing disabled</Text>
+        ) : (
+          <Text color={theme.good}>routing enabled</Text>
+        )}
+      </Text>
+      {app.domains.length === 0 ? (
+        <Text color={theme.dim}> (none set)</Text>
+      ) : (
+        app.domains.map((d) => {
+          const cov = certCovers(d, app.ssl);
+          return (
+            <Text key={d} wrap="truncate-end">
+              {' '}• {d}
+              {cov === null ? null : cov ? (
+                <Text color={theme.good}>  ✓ cert</Text>
+              ) : (
+                <Text color={theme.warn}>  ✗ no cert</Text>
+              )}
+            </Text>
+          );
+        })
+      )}
+      <Text> </Text>
+      <Text wrap="truncate-end">
+        {lbl('SSL')}
+        <Text color={sb.color}>{sb.text}</Text>
+        {app.ssl ? (
+          <>
+            {app.ssl.issuer ? ` · ${fmtIssuer(app.ssl.issuer)}` : ''}
+            {` · expires ${fmtDate(app.ssl.expiresAt)}`}
+            {days !== null ? <Text color={days <= 14 ? theme.warn : theme.dim}> ({days}d)</Text> : null}
+            {/* dokku reports verified:no for routine self-managed LE certs —
+                worth a note, not a warning color. */}
+            {app.ssl.verified === false ? <Text color={theme.dim}> · unverified</Text> : null}
+          </>
+        ) : null}
+      </Text>
+    </>
+  );
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {app.name}
+        </Text>
+        <Text color={theme.dim}>
+          {'  '}created {fmtDate(app.createdAt)} · deploy {app.deploySource || '—'} · restart {app.restartPolicy || '—'}
+        </Text>
+      </Text>
+      {stacked ? (
+        <>
+          {left}
+          <Text> </Text>
+          {right}
+        </>
+      ) : (
+        <Box>
+          <Box flexDirection="column" width={leftW} flexShrink={0} marginRight={2}>
+            {left}
+          </Box>
+          <Box flexDirection="column" flexGrow={1}>
+            {right}
+          </Box>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -497,9 +570,9 @@ function AppTable({
           padEnd('NAME', nameW) +
           padEnd('STATUS', statusW) +
           padEnd('PROCESSES', procW) +
-          padEnd('CPU', cpuW) +
-          padEnd('MEM', memW) +
-          padEnd('AGE', ageW) +
+          padNum('CPU', cpuW) +
+          padNum('MEM', memW) +
+          padNum('AGE', ageW) +
           padEnd('SSL', sslW) +
           'DOMAIN'}
       </Text>
@@ -524,10 +597,10 @@ function AppTable({
             <Text wrap="truncate-end" {...cell(rb.color)}>{padEnd(rb.text, statusW)}</Text>
             <Text wrap="truncate-end" {...cell(theme.text)}>{padEnd(proc, procW)}</Text>
             <Text wrap="truncate-end" {...cell(usage.cpu !== null && usage.cpu >= 80 ? theme.warn : theme.dim)}>
-              {padEnd(fmtPct(usage.cpu), cpuW)}
+              {padNum(fmtPct(usage.cpu), cpuW)}
             </Text>
-            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(fmtBytes(usage.mem), memW)}</Text>
-            <Text wrap="truncate-end" {...cell(theme.dim)}>{padEnd(fmtAgeDays(a.createdAt), ageW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padNum(fmtBytes(usage.mem), memW)}</Text>
+            <Text wrap="truncate-end" {...cell(theme.dim)}>{padNum(fmtAgeDays(a.createdAt), ageW)}</Text>
             <Text wrap="truncate-end" {...cell(sb.color)}>{padEnd(sb.text, sslW)}</Text>
             <Text wrap="truncate-end" {...cell(theme.dim)}>{domain}</Text>
           </Box>
@@ -568,93 +641,6 @@ function certCovers(domain: string, ssl: DokkuApp['ssl']): boolean | null {
     h.startsWith('*.')
       ? domain.endsWith(h.slice(1)) && domain.split('.').length === h.split('.').length
       : h === domain,
-  );
-}
-
-function DomainsView({
-  app,
-  detail,
-  stats,
-  width,
-}: {
-  app?: DokkuApp;
-  detail?: AppDetail;
-  stats: StatsMap | null;
-  width: number;
-}): ReactNode {
-  if (!app) return <Text color={theme.dim}>No app selected.</Text>;
-  const sb = sslBadge(app.ssl);
-  const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
-  const leftW = Math.min(64, Math.max(28, Math.floor(width * 0.55)));
-  return (
-    <Box flexDirection="column">
-      <AppHeader app={app} stats={stats} />
-      <Box>
-        <Box flexDirection="column" width={leftW} flexShrink={0} marginRight={2}>
-          <Text wrap="truncate-end" color={theme.dim}>
-            DOMAINS{'  '}
-            {app.domainsEnabled === false ? (
-              <Text color={theme.warn}>routing disabled</Text>
-            ) : (
-              <Text color={theme.good}>routing enabled</Text>
-            )}
-          </Text>
-          {app.domains.length === 0 ? (
-            <Text color={theme.dim}> (none set)</Text>
-          ) : (
-            app.domains.map((d) => {
-              const cov = certCovers(d, app.ssl);
-              return (
-                <Text key={d} wrap="truncate-end">
-                  {' '}• {d}
-                  {cov === null ? null : cov ? (
-                    <Text color={theme.good}>  ✔ cert</Text>
-                  ) : (
-                    <Text color={theme.warn}>  ✗ no cert</Text>
-                  )}
-                </Text>
-              );
-            })
-          )}
-          <Text> </Text>
-          <Text color={theme.dim}>PORTS</Text>
-          {!detail ? (
-            <Text color={theme.dim}> …</Text>
-          ) : detail.ports.length === 0 ? (
-            <Text color={theme.dim}> (none mapped)</Text>
-          ) : (
-            detail.ports.map((p) => (
-              <Text key={p} wrap="truncate-end">
-                {' '}• {p}
-              </Text>
-            ))
-          )}
-        </Box>
-        <Box flexDirection="column" flexGrow={1}>
-          <Text color={theme.dim}>SSL CERTIFICATE</Text>
-          <Text wrap="truncate-end">
-            {' '}
-            Status: <Text color={sb.color}>{sb.text}</Text>
-          </Text>
-          {app.ssl ? (
-            <>
-              {app.ssl.issuer ? <Text wrap="truncate-end"> Issuer: {app.ssl.issuer}</Text> : null}
-              <Text wrap="truncate-end">
-                {' '}
-                Expires: {fmtDate(app.ssl.expiresAt)}
-                {days !== null ? <Text color={days <= 14 ? theme.warn : theme.dim}> ({days}d)</Text> : null}
-              </Text>
-              {app.ssl.verified !== null ? (
-                <Text wrap="truncate-end">
-                  {' '}
-                  Verified: <Text color={app.ssl.verified ? theme.good : theme.warn}>{app.ssl.verified ? 'yes' : 'no'}</Text>
-                </Text>
-              ) : null}
-            </>
-          ) : null}
-        </Box>
-      </Box>
-    </Box>
   );
 }
 
@@ -1755,13 +1741,11 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
           detail={currentDetail}
           loading={detailLoading}
           services={services ? services.list : null}
+          width={colBudget}
         />
       ) : (
         <Text color={theme.dim}>No app selected.</Text>
       );
-      break;
-    case 'domains':
-      content = <DomainsView app={currentApp} detail={currentDetail} stats={statsMap} width={colBudget} />;
       break;
     case 'process':
       content = <ProcessView app={currentApp} stats={statsMap} detail={currentDetail} />;
