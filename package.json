@@ -1,7 +1,7 @@
 {
   "name": "dokku-ink",
   "version": "0.1.4",
-  "description": "A terminal dashboard & cheat sheet for Dokku. Read-only visualizer that runs directly on your Dokku host.",
+  "description": "A terminal dashboard & command center for Dokku. See all your apps and run any dokku command, on the host or over SSH.",
   "type": "module",
   "bin": {
     "dokku-ink": "dist/index.js"

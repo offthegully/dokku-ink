@@ -91,7 +91,7 @@ OPTIONS
   -v, --version  Show version
 
 KEYS (inside the dashboard)
-  1-7            Jump to a view
+  1-5            Jump to a view
   ↑ / ↓          Select the app in the table (move in Services/Cheat Sheet)
   ← / → (h/l)    Switch view (tab / shift-tab too)
   j / k          Scroll the detail pane (Logs scrollback, long Config lists)
@@ -114,5 +114,5 @@ ENV
   DOKKU_INK_NO_UPDATE_CHECK  Set to disable the on-launch new-release check
 
 Run this on your Dokku host (or point --ssh at one); it shells out to
-the \`dokku\` CLI (read-only) — no REST API or extra services needed.`);
+the \`dokku\` CLI directly — no REST API or extra services needed.`);
 }
