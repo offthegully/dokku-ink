@@ -32,6 +32,7 @@ import {
   watchEvents,
 } from './dokku.js';
 import { remoteLabel } from './exec.js';
+import { checkForUpdate } from './update.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type {
   AppDetail,
@@ -101,6 +102,41 @@ const QUICK_ACTIONS: Record<string, string> = {
   B: 'ps:rebuild $app',
 };
 
+// Commands that need a confirm step before running — matched on the typed
+// text itself (not just the R/S/B hotkeys), so hand-typing `ps:stop foo` into
+// `:` gets the same guard as pressing S. The QUICK_ACTIONS verbs are pulled
+// in automatically so a new hotkey can't silently skip confirmation; the rest
+// are other irreversible/data-losing commands reachable from the free-form
+// `:` prompt or the cheat sheet (see cheatsheet.ts's "irreversible" entries).
+const OTHER_DESTRUCTIVE_VERBS = ['apps:destroy', 'domains:clear', 'config:unset'];
+const DESTRUCTIVE_VERBS = [
+  ...new Set(Object.values(QUICK_ACTIONS).map((cmd) => cmd.split(' ')[0])),
+  ...OTHER_DESTRUCTIVE_VERBS,
+];
+const DESTRUCTIVE_RE = new RegExp(`^(${DESTRUCTIVE_VERBS.join('|')})\\b`, 'i');
+
+// Strips the optional leading "dokku " a user may type — the one true
+// normalization startCommand, isDestructive, and the confirm prompt all use,
+// so a typed "dokku ps:stop foo" is treated identically to "ps:stop foo"
+// everywhere instead of only some of these agreeing.
+function stripDokkuPrefix(cmd: string): string {
+  return cmd.trim().replace(/^dokku\s+/, '');
+}
+
+function isDestructive(cmd: string): boolean {
+  return DESTRUCTIVE_RE.test(stripDokkuPrefix(cmd));
+}
+
+// Expands the literal `$app` token to the selected app's name — the same
+// substitution startCommand runs, reused so what a confirm prompt displays
+// matches what will actually execute.
+function resolveAppPlaceholder(cmd: string, appName?: string): string {
+  return cmd
+    .split(/\s+/)
+    .map((t) => (t === '$app' ? appName ?? t : t))
+    .join(' ');
+}
+
 // ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
@@ -149,6 +185,7 @@ function Header({
   disk,
   refreshing,
   age,
+  update,
 }: {
   source: Source;
   host: string;
@@ -157,6 +194,7 @@ function Header({
   disk: HostDisk | null;
   refreshing: boolean;
   age: number | null; // seconds since the last successful refresh
+  update?: string | null; // latest release tag when a newer one is available
 }): ReactNode {
   // Fixed-width slot so the readout never nudges the rest of the header.
   const fresh = refreshing ? '↻ …' : age !== null ? `↻ ${fmtAge(age)}` : '';
@@ -169,6 +207,9 @@ function Header({
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
       <Box>
+        {update ? (
+          <Text color={theme.good}>↑ {update.replace(/^v/i, '')}{'  '}</Text>
+        ) : null}
         <Text color={refreshing ? theme.accent : theme.dim}>{padEnd(fresh, 8)}</Text>
         {disk ? (
           <Text color={disk.usedPct >= 90 ? theme.bad : disk.usedPct >= 80 ? theme.warn : theme.dim}>
@@ -301,6 +342,20 @@ function CommandBar({ text, app }: { text: string; app?: string }): ReactNode {
       <Text wrap="truncate-end" color={theme.dim}>
         {'   '}enter run · esc cancel · ↑↓ history{app ? ` · $app → ${app}` : ''}
       </Text>
+    </Box>
+  );
+}
+
+// Replaces the CommandBar for one extra keypress before a destructive
+// command actually runs. Shows the command with `$app` already resolved —
+// the whole point of confirming a per-app action is naming the app.
+function ConfirmBar({ cmd, app }: { cmd: string; app?: string }): ReactNode {
+  return (
+    <Box paddingX={1}>
+      <Text color={theme.warn} bold wrap="truncate-end">
+        ⚠ run "dokku {resolveAppPlaceholder(cmd, app)}"?{' '}
+      </Text>
+      <Text wrap="truncate-end" color={theme.dim}>enter/y confirm · esc/n cancel</Text>
     </Box>
   );
 }
@@ -906,6 +961,9 @@ function ServiceDetail({
 }
 
 function HelpView(): ReactNode {
+  // Key column is padded to the widest key so the two columns stay aligned;
+  // padEnd truncates anything longer, so keep this >= the longest key below.
+  const keyW = 26;
   const rows: Array<[string, string] | null> = [
     [`1-${VIEWS.length}`, 'jump to a view'],
     ['←→ / hl / tab', 'next / previous view'],
@@ -916,7 +974,7 @@ function HelpView(): ReactNode {
     ['/', 'filter the app list (or cheat sheet) · esc clears'],
     ['s', 'reveal/hide secrets (Config values, service DSN)'],
     null,
-    ['R / S / B', 'prefill restart / stop / rebuild for the selected app'],
+    ['R / S / B', 'prefill restart / stop / rebuild for the selected app (enter confirms)'],
     [':', 'type any dokku command ($app → selected app, ↑↓ history)'],
     ['r', 'refresh now (full report sweep)'],
     ['q / ctrl-c', 'quit'],
@@ -924,6 +982,7 @@ function HelpView(): ReactNode {
     ['DOKKU_INK_SSH', 'run remotely: dokku@host (dokku commands only) or user@host'],
     ['DOKKU_INK_REFRESH', 'poll seconds (default 30, 0 = off)'],
     ['DOKKU_INK_BIN', 'dokku binary path'],
+    ['DOKKU_INK_NO_UPDATE_CHECK', 'disable the ↑ new-release check on launch'],
     ['dokku events:on', 'enable push-based refresh on the host'],
   ];
   return (
@@ -934,7 +993,7 @@ function HelpView(): ReactNode {
         ) : (
           <Box key={i}>
             <Text color={theme.accent} bold>
-              {padEnd(r[0], 20)}
+              {padEnd(r[0], keyW)}
             </Text>
             <Text wrap="truncate-end" color={theme.text}>{r[1]}</Text>
           </Box>
@@ -1087,7 +1146,7 @@ function windowHint(total: number, start: number, shown: number): ReactNode {
 // App
 // ---------------------------------------------------------------------------
 
-export default function App(): ReactNode {
+export default function App({ version }: { version?: string } = {}): ReactNode {
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
 
@@ -1100,6 +1159,9 @@ export default function App(): ReactNode {
   const [cheatCursor, setCheatCursor] = useState(1); // first item under first group
   const [cheatOpen, setCheatOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // Latest release tag when a newer one exists (else null) — shown as a chip in
+  // the header. Resolved once on mount, off the render path.
+  const [update, setUpdate] = useState<string | null>(null);
 
   const [data, setData] = useState<Overview | null>(null);
   const [stats, setStats] = useState<StatsResult | null>(null);
@@ -1127,6 +1189,9 @@ export default function App(): ReactNode {
   // `:` command line — the prompt text (null = closed), the running/finished
   // command overlay, its streamed output, and a session-local history.
   const [cmdInput, setCmdInput] = useState<string | null>(null);
+  // Set while a destructive command (see isDestructive) is awaiting a second
+  // keypress before it actually runs; holds the exact text to run on confirm.
+  const [cmdConfirm, setCmdConfirm] = useState<string | null>(null);
   const [histIdx, setHistIdx] = useState<number | null>(null);
   const cmdHistory = useRef<string[]>([]);
   const [cmdRun, setCmdRun] = useState<{ cmd: string; running: boolean } | null>(null);
@@ -1180,6 +1245,21 @@ export default function App(): ReactNode {
     void refresh('full');
   }, [refresh]);
 
+  // One-shot, best-effort update check. Fires after the first paint so it never
+  // delays startup, and checkForUpdate swallows every error, so a failed or
+  // slow network is invisible. The cancelled guard just avoids a post-unmount
+  // setState during tests.
+  useEffect(() => {
+    if (!version) return;
+    let cancelled = false;
+    void checkForUpdate(version).then((tag) => {
+      if (!cancelled) setUpdate(tag);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [version]);
+
   const pollSeconds = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
   const pollCount = useRef(0);
   useEffect(() => {
@@ -1214,13 +1294,13 @@ export default function App(): ReactNode {
   // the selected app. Output streams into the overlay with the same buffered
   // flush as logs, and a refresh follows so the views reflect any changes.
   const startCommand = (raw: string) => {
-    const text = raw.trim().replace(/^dokku\s+/, '');
+    const text = stripDokkuPrefix(raw);
     setCmdInput(null);
     setHistIdx(null);
     if (!text) return;
     if (cmdHistory.current[cmdHistory.current.length - 1] !== text) cmdHistory.current.push(text);
-    const args = text.split(/\s+/).map((t) => (t === '$app' ? currentApp?.name ?? t : t));
-    const shown = args.join(' ');
+    const shown = resolveAppPlaceholder(text, currentApp?.name);
+    const args = shown.split(/\s+/);
     cmdStopRef.current?.();
     setCmdOutput([]);
     setCmdScroll(0);
@@ -1430,12 +1510,30 @@ export default function App(): ReactNode {
 
     // The `:` prompt owns the keyboard while open.
     if (cmdInput !== null) {
+      // A destructive command is pending a second keypress — this step
+      // swallows all input except confirm/cancel.
+      if (cmdConfirm !== null) {
+        if (key.escape || input === 'n' || input === 'N') {
+          setCmdConfirm(null); // back to the editable prompt, nothing ran
+          return;
+        }
+        if (key.return || input === 'y' || input === 'Y') {
+          startCommand(cmdConfirm);
+          setCmdConfirm(null);
+          return;
+        }
+        return;
+      }
       if (key.escape) {
         setCmdInput(null);
         setHistIdx(null);
         return;
       }
       if (key.return) {
+        if (isDestructive(cmdInput)) {
+          setCmdConfirm(stripDokkuPrefix(cmdInput));
+          return;
+        }
         startCommand(cmdInput);
         return;
       }
@@ -1641,7 +1739,7 @@ export default function App(): ReactNode {
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} age={null} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} age={null} update={update} />
         <Loading />
       </Box>
     );
@@ -1750,6 +1848,7 @@ export default function App(): ReactNode {
         disk={stats?.disk ?? null}
         refreshing={refreshing && !loading}
         age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
+        update={update}
       />
       {overlayTitle ? (
         <Box flexGrow={1} flexDirection="column" overflow="hidden" borderStyle="round" borderColor={theme.dim} paddingX={2}>
@@ -1781,7 +1880,11 @@ export default function App(): ReactNode {
         </>
       )}
       {cmdInput !== null ? (
-        <CommandBar text={cmdInput} app={currentApp?.name} />
+        cmdConfirm !== null ? (
+          <ConfirmBar cmd={cmdConfirm} app={currentApp?.name} />
+        ) : (
+          <CommandBar text={cmdInput} app={currentApp?.name} />
+        )
       ) : filterInput !== null ? (
         <FilterBar text={filterInput} target={filterTarget === 'cheat' ? 'cheat sheet' : 'apps'} />
       ) : (

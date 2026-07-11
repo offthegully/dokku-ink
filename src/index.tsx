@@ -73,7 +73,7 @@ const syncStdout = process.stdout.isTTY
     }) as unknown as NodeJS.WriteStream)
   : process.stdout;
 
-const { waitUntilExit } = render(<App />, { stdout: syncStdout, exitOnCtrlC: false });
+const { waitUntilExit } = render(<App version={version} />, { stdout: syncStdout, exitOnCtrlC: false });
 await waitUntilExit();
 
 function printHelp(): void {
@@ -111,6 +111,7 @@ ENV
   DOKKU_INK_HOST     Label shown in the header (default: hostname)
   DOKKU_INK_DEMO     Set to 1 to force demo data
   DOKKU_INK_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
+  DOKKU_INK_NO_UPDATE_CHECK  Set to disable the on-launch new-release check
 
 Run this on your Dokku host (or point --ssh at one); it shells out to
 the \`dokku\` CLI (read-only) — no REST API or extra services needed.`);

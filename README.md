@@ -215,6 +215,7 @@ with your Dokku version.
 | `DOKKU_INK_HOST`   | hostname   | Label shown in the header                |
 | `DOKKU_INK_DEMO`   | –          | Set to `1` to force demo data            |
 | `DOKKU_INK_REFRESH`| `30`       | Auto-refresh interval in seconds (`0` disables) |
+| `DOKKU_INK_NO_UPDATE_CHECK` | – | Set to disable the on-launch check for a newer release (also honors `NO_UPDATE_NOTIFIER`) |
 
 ## How it reads data
 

@@ -145,6 +145,103 @@ test('`:` opens the command bar and escape closes it', () =>
     assert.doesNotMatch(lastFrame() ?? '', /: dokku/);
   }));
 
+test('R/S/B quick actions prefill the `:` prompt and require a confirm before running', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write('S'); // prefill ps:stop for the selected app
+    await tick(20);
+    assert.match(lastFrame() ?? '', /: dokku ps:stop \$app/);
+
+    stdin.write('\r'); // first enter — must NOT run yet
+    await tick(20);
+    let frame = lastFrame() ?? '';
+    // The selected app's name is resolved in the confirm text, not left as
+    // the literal `$app` placeholder — otherwise the dialog doesn't actually
+    // say what it's about to affect.
+    assert.match(frame, /run "dokku ps:stop blog"\?/);
+    assert.doesNotMatch(frame, /COMMAND/);
+
+    stdin.write('\x1b'); // esc backs out of the confirm, back to the editable prompt
+    await tick(20);
+    frame = lastFrame() ?? '';
+    assert.match(frame, /: dokku ps:stop \$app/);
+    assert.doesNotMatch(frame, /run "dokku/);
+
+    stdin.write('\r'); // enter again to re-reach the confirm step
+    await tick(20);
+    stdin.write('n'); // 'n' cancels just like esc
+    await tick(20);
+    frame = lastFrame() ?? '';
+    assert.match(frame, /: dokku ps:stop \$app/);
+    assert.doesNotMatch(frame, /run "dokku/);
+
+    stdin.write('\r'); // enter a third time to re-reach the confirm step
+    await tick(20);
+    stdin.write('y'); // 'y' confirms just like enter
+    await tick(80);
+    frame = lastFrame() ?? '';
+    assert.match(frame, /COMMAND/);
+    assert.match(frame, /\$ dokku ps:stop blog/);
+  }));
+
+test('non-destructive `:` commands still run on a single enter', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    stdin.write(':');
+    await tick(20);
+    stdin.write('apps:list');
+    await tick(20);
+    stdin.write('\r');
+    await tick(80);
+    const frame = lastFrame() ?? '';
+    assert.match(frame, /COMMAND/);
+    assert.match(frame, /\$ dokku apps:list/);
+  }));
+
+test('confirm guard cannot be bypassed by a `dokku ` prefix, different casing, or other irreversible verbs', () =>
+  withApp(async ({ lastFrame, stdin }) => {
+    // "dokku ps:stop" — startCommand strips the `dokku ` prefix before
+    // running, so the confirm check has to match on the same stripped text.
+    stdin.write(':');
+    await tick(20);
+    stdin.write('dokku ps:stop blog');
+    await tick(20);
+    stdin.write('\r');
+    await tick(20);
+    let frame = lastFrame() ?? '';
+    assert.match(frame, /run "dokku ps:stop blog"\?/);
+    assert.doesNotMatch(frame, /COMMAND/);
+    stdin.write('\x1b'); // cancel
+    await tick(20);
+    stdin.write('\x1b'); // close the `:` prompt entirely
+    await tick(20);
+
+    // Case shouldn't matter.
+    stdin.write(':');
+    await tick(20);
+    stdin.write('Ps:Stop blog');
+    await tick(20);
+    stdin.write('\r');
+    await tick(20);
+    frame = lastFrame() ?? '';
+    assert.match(frame, /run "dokku Ps:Stop blog"\?/);
+    assert.doesNotMatch(frame, /COMMAND/);
+    stdin.write('\x1b');
+    await tick(20);
+    stdin.write('\x1b');
+    await tick(20);
+
+    // Other irreversible commands beyond the R/S/B trio also get gated —
+    // apps:destroy is the cheat sheet's own example of an irreversible command.
+    stdin.write(':');
+    await tick(20);
+    stdin.write('apps:destroy blog');
+    await tick(20);
+    stdin.write('\r');
+    await tick(20);
+    frame = lastFrame() ?? '';
+    assert.match(frame, /run "dokku apps:destroy blog"\?/);
+    assert.doesNotMatch(frame, /COMMAND/);
+  }));
+
 test('config view masks values until revealed', () =>
   withApp(async ({ lastFrame, stdin }) => {
     stdin.write('4'); // Config / Env view
