@@ -48,17 +48,13 @@ else
   err "need curl or wget to download the binary"
 fi
 
-# --- download & make executable --------------------------------------------
+# --- download --------------------------------------------------------------
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 info "downloading ${asset} (${DOKKU_INK_VERSION:-latest})"
 download "$url" "$tmp" || err "download failed: $url
 (has a release with prebuilt binaries been published yet?)"
-
-# Explicit 0755 (not `chmod +x`, which respects umask and can leave the binary
-# 0700 — unreadable/unexecutable by other users after a root-owned install).
-chmod 755 "$tmp"
 
 # --- install into the first directory that accepts it ----------------------
 # Tries, in order: the requested dir directly; the same dir via sudo (only for
@@ -68,10 +64,11 @@ chmod 755 "$tmp"
 requested="${DOKKU_INK_INSTALL_DIR:-/usr/local/bin}"
 
 move_into() { # move_into <dir> <sudo-prefix> ; nonzero on any failure
-  _dir="$1"; _pfx="$2"
+  _dir="$1"
+  _pfx="$2"
   [ -n "$_dir" ] || return 1
   $_pfx mkdir -p "$_dir" 2>/dev/null || return 1
-  $_pfx mv "$tmp" "${_dir}/${BIN_NAME}" 2>/dev/null || return 1
+  $_pfx install -m 755 "$tmp" "${_dir}/${BIN_NAME}" 2>/dev/null || return 1
 }
 
 dest=""
@@ -90,7 +87,6 @@ if [ -z "$dest" ]; then
 Re-run pointing at a directory you own, e.g.:
   ... | DOKKU_INK_INSTALL_DIR=\"\$HOME/.local/bin\" sh"
 fi
-trap - EXIT
 
 install_dir="$(dirname "$dest")"
 info "installed to ${dest}"
