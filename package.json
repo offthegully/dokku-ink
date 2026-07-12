@@ -1,6 +1,6 @@
 {
   "name": "dokku-ink",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A terminal dashboard & command center for Dokku. See all your apps and run any dokku command, on the host or over SSH.",
   "type": "module",
   "bin": {
