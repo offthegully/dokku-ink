@@ -79,9 +79,21 @@ const REFRESH_SECONDS = (() => {
 // Processes view is open, poll on a tighter leash (never slower than the
 // configured cadence, never faster than 10s).
 const FAST_REFRESH_SECONDS = REFRESH_SECONDS ? Math.min(10, REFRESH_SECONDS) : 0;
-// Most polls are "light" (ps + docker stats only); every Nth does the full
-// report sweep. Deploys/config changes trigger a full refresh via events.
+// Most polls are "light" (ps only); every Nth does the full report sweep.
+// Deploys/config changes trigger a full refresh via events.
 const FULL_REFRESH_EVERY = 5;
+// `docker stats --no-stream` has to wait out a sampling interval (~2s), so it
+// runs on its own slower timer instead of gating the app list on every poll.
+const STATS_SECONDS = REFRESH_SECONDS ? Math.max(15, REFRESH_SECONDS) : 0;
+// Datastore services move on human timescales (create/link), not on deploys,
+// so a dataV bump alone doesn't earn the plugin:list + per-service info sweep.
+const SERVICES_TTL_MS = 60_000;
+// Debounce before a per-app fetch fires, so holding ↑↓ through the list walks
+// rows without spawning a subprocess per row.
+const APP_FETCH_DEBOUNCE_MS = 200;
+// Attaching a log tail is the most expensive per-row action (a spawn plus a
+// 100-line replay), so it waits a little longer than the report fetches.
+const LOG_ATTACH_DEBOUNCE_MS = 350;
 
 const LOG_CAP = 500;
 // Keep per-app log buffers around after leaving the view, so flipping between
@@ -101,6 +113,14 @@ const QUICK_ACTIONS: Record<string, string> = {
   R: 'ps:restart $app',
   S: 'ps:stop $app',
   B: 'ps:rebuild $app',
+};
+
+// Read-only single-key actions that prefill the `:` prompt. Unlike
+// QUICK_ACTIONS these are not folded into DESTRUCTIVE_VERBS, because none of
+// them changes anything — `logs:failed` is how you find out why a deploy died.
+const SAFE_ACTIONS: Record<string, string> = {
+  F: 'logs:failed $app',
+  I: 'ps:inspect $app',
 };
 
 // Commands that need a confirm step before running — matched on the typed
@@ -187,6 +207,7 @@ function Header({
   refreshing,
   age,
   update,
+  error,
 }: {
   source: Source;
   host: string;
@@ -196,6 +217,7 @@ function Header({
   refreshing: boolean;
   age: number | null; // seconds since the last successful refresh
   update?: string | null; // latest release tag when a newer one is available
+  error?: string | null; // last refresh failure, if the latest one failed
 }): ReactNode {
   // Fixed-width slot so the readout never nudges the rest of the header.
   const fresh = refreshing ? '↻ …' : age !== null ? `↻ ${fmtAge(age)}` : '';
@@ -208,6 +230,9 @@ function Header({
         <Text wrap="truncate-end" color={theme.dim}> · {host}</Text>
       </Box>
       <Box>
+        {error ? (
+          <Text wrap="truncate-end" color={theme.bad}>⚠ refresh failed{'  '}</Text>
+        ) : null}
         {update ? (
           <Text color={theme.good}>↑ {update.replace(/^v/i, '')}{'  '}</Text>
         ) : null}
@@ -288,10 +313,11 @@ function Footer({ view, columns, overlay }: { view: number; columns: number; ove
     keys.push([`1-${VIEWS.length}`, 'view', 4]);
     keys.push(['←→', 'switch view', 3]);
     keys.push(['↑↓', v.perApp ? 'app' : 'move', 9]);
-    if (v.key === 'logs' || v.key === 'config') keys.push(['j/k', 'scroll', 6]);
+    if (v.key === 'logs' || v.key === 'config' || v.key === 'process') keys.push(['j/k', 'scroll', 6]);
     if (v.perApp) keys.push(['/', 'filter', 5]);
     if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
     if (v.perApp) keys.push(['R/S/B', 'actions', 4]);
+    if (v.perApp) keys.push(['F', 'failed logs', 3]);
     keys.push([':', 'command', 7]);
     keys.push(['c', 'cheats', 6]);
     keys.push(['r', 'refresh', 2]);
@@ -399,6 +425,12 @@ function AppSummary({
 }): ReactNode {
   const linked = (services ?? []).filter((s) => s.links.includes(app.name));
   const lbl = (t: string) => <Text color={theme.dim}>{padEnd(t, 9)}</Text>;
+  const cb = checksBadge(app.checks);
+  // Resource limits/reservations, compacted onto one line: "web 512m/1cpu".
+  const limitSummary =
+    detail && detail.resources.length > 0
+      ? detail.resources.map((r) => `${r.processType} ${fmtResource(r)}`).join(' · ')
+      : null;
   const sb = sslBadge(app.ssl);
   const days = app.ssl ? daysUntil(app.ssl.expiresAt) : null;
   const stacked = width < 90;
@@ -444,6 +476,25 @@ function AppSummary({
           ))}
         </>
       )}
+      {limitSummary ? (
+        <Text wrap="truncate-end">
+          {lbl('LIMITS')}
+          {limitSummary}
+        </Text>
+      ) : null}
+      <Text wrap="truncate-end">
+        {lbl('RUNTIME')}
+        {app.proxy?.type ?? '—'}
+        {app.proxy && app.proxy.enabled === false ? (
+          <Text color={theme.warn}> (proxy off)</Text>
+        ) : app.proxy?.port ? (
+          <Text color={theme.dim}> :{app.proxy.port}/:{app.proxy.sslPort ?? '—'}</Text>
+        ) : null}
+        <Text color={theme.dim}> · checks </Text>
+        <Text color={cb.color}>{cb.text}</Text>
+        {app.cronTasks ? <Text color={theme.dim}> · cron {app.cronTasks} task{app.cronTasks === 1 ? '' : 's'}</Text> : null}
+        {app.locked ? <Text color={theme.warn}> · locked</Text> : null}
+      </Text>
       <Text wrap="truncate-end">
         {lbl('LINKED')}
         {services === null ? (
@@ -611,8 +662,19 @@ function AppTable({
   );
 }
 
-// Shared first line of every per-app view: name, run state, live usage.
-function AppHeader({ app, stats, extra }: { app: DokkuApp; stats: StatsMap | null; extra?: string }): ReactNode {
+// Shared first line of every per-app view: name, run state, live usage. `extra`
+// is a node, not a string, so callers can colour part of the trailing facts
+// (checks state, say) without spending another row on them — the detail pane
+// is only a handful of rows tall on a short terminal.
+function AppHeader({
+  app,
+  stats,
+  extra,
+}: {
+  app: DokkuApp;
+  stats: StatsMap | null;
+  extra?: ReactNode;
+}): ReactNode {
   const rb = runningBadge(app);
   const usage = appUsage(app, stats);
   return (
@@ -644,6 +706,35 @@ function certCovers(domain: string, ssl: DokkuApp['ssl']): boolean | null {
   );
 }
 
+// Checks are the zero-downtime health gate; "off" or "skipped" means a broken
+// release can go live unnoticed, so they read as warnings rather than facts.
+function checksBadge(checks: DokkuApp['checks']): { text: string; color: string } {
+  if (!checks) return { text: '—', color: theme.dim };
+  const all = (list: string[]) => list.includes('_all_');
+  if (all(checks.disabled)) return { text: 'off (all)', color: theme.warn };
+  if (checks.disabled.length > 0)
+    return { text: `off (${checks.disabled.join(',')})`, color: theme.warn };
+  if (all(checks.skipped)) return { text: 'skipped (all)', color: theme.warn };
+  if (checks.skipped.length > 0)
+    return { text: `skipped (${checks.skipped.join(',')})`, color: theme.warn };
+  return { text: 'on', color: theme.good };
+}
+
+// "512m/1cpu res 256m" — limits first, reservations after, both compacted.
+function fmtResource(r: { limits: Record<string, string>; reserves: Record<string, string> }): string {
+  const fmt = (vals: Record<string, string>) =>
+    Object.entries(vals)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => (k === 'cpu' ? `${v}cpu` : v))
+      .join('/');
+  const lim = fmt(r.limits);
+  const res = fmt(r.reserves);
+  if (!lim && !res) return '';
+  if (!res) return `limit ${lim}`;
+  if (!lim) return `reserve ${res}`;
+  return `limit ${lim} · reserve ${res}`;
+}
+
 function statusColor(s: string): string {
   if (/^running/i.test(s)) return theme.good;
   if (/^exited \(0\)/i.test(s)) return theme.dim;
@@ -651,63 +742,122 @@ function statusColor(s: string): string {
   return theme.warn;
 }
 
+// The Processes pane's content as a flat list of rows. Built separately from
+// the component so the key handler can ask how many rows there are without
+// duplicating the layout: the pane is taller than the viewport on a short
+// terminal, and letting Yoga squeeze it silently dropped arbitrary rows —
+// including the process-type headers with the scale and limits on them.
+function processRows(app: DokkuApp, stats: StatsMap | null, detail?: AppDetail): ReactNode[] {
+  const rows: ReactNode[] = [];
+  const cb = checksBadge(app.checks);
+  rows.push(
+    <AppHeader
+      key="head"
+      app={app}
+      stats={stats}
+      extra={
+        <>
+          {'   '}restart {app.restartPolicy || '—'}
+          {'   '}checks <Text color={cb.color}>{cb.text}</Text>
+          {app.proxy ? `   proxy ${app.proxy.type ?? '—'}${app.proxy.enabled === false ? ' (off)' : ''}` : ''}
+          {app.cronTasks ? `   cron ${app.cronTasks}` : ''}
+          {app.locked ? <Text color={theme.warn}>{'   '}locked</Text> : null}
+        </>
+      }
+    />,
+  );
+  rows.push(<Text key="procs-h" color={theme.dim}>PROCESSES</Text>);
+  if (app.processes.length === 0) {
+    rows.push(
+      <Text key="procs-none" color={theme.dim}> No process info (not deployed?)</Text>,
+    );
+  }
+  for (const p of app.processes) {
+    // p.scale is the number of live containers; the desired count comes from
+    // ps:scale, and a gap between the two is the interesting case — a crashed
+    // instance reads as "web ×1" otherwise.
+    const desired = detail?.scale[p.type];
+    const short = desired !== undefined && desired > p.scale;
+    const res =
+      detail?.resources.find((r) => r.processType === p.type) ??
+      detail?.resources.find((r) => r.processType === '_default_');
+    rows.push(
+      <Text key={`p-${p.type}`} bold wrap="truncate-end">
+        {' '}
+        {p.type}{' '}
+        <Text color={short ? theme.warn : theme.dim}>
+          scale {p.scale}
+          {desired !== undefined && desired !== p.scale ? ` / ${desired} wanted` : ''}
+        </Text>
+        {res ? <Text color={theme.dim}>  {fmtResource(res)}</Text> : null}
+      </Text>,
+    );
+    for (const inst of p.instances) {
+      const st = stats?.[`${app.name}.${p.type}.${inst.index}`];
+      rows.push(
+        <Text key={`i-${p.type}-${inst.index}`} wrap="truncate-end">
+          {'   '}
+          {p.type}.{inst.index}{'  '}
+          <Text color={statusColor(inst.status)}>{inst.status}</Text>
+          {st ? (
+            <Text color={theme.dim}>
+              {'  '}cpu {fmtPct(st.cpuPct)} · mem {fmtBytes(st.memBytes)}
+              {st.memLimitBytes ? ` / ${fmtBytes(st.memLimitBytes)}` : ''}
+            </Text>
+          ) : null}
+        </Text>,
+      );
+    }
+  }
+  rows.push(<Text key="sp-1"> </Text>);
+  rows.push(<Text key="deploy-h" color={theme.dim}>DEPLOY</Text>);
+  rows.push(
+    <Text key="deploy" wrap="truncate-end">
+      {' '}via {app.deploySource || '—'}
+      {detail?.git.sourceImage ? ` · image ${detail.git.sourceImage}` : ''}
+      {detail && !detail.git.sourceImage && (detail.git.branch || detail.git.sha)
+        ? ` · branch ${detail.git.branch ?? '—'} · sha ${detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed ${fmtDate(detail.git.lastUpdated)}`
+        : ''}
+      <Text color={theme.dim}> · created {fmtDate(app.createdAt)}</Text>
+    </Text>,
+  );
+  rows.push(<Text key="sp-2"> </Text>);
+  rows.push(<Text key="net-h" color={theme.dim}>NETWORK</Text>);
+  rows.push(
+    <Text key="net" wrap="truncate-end">
+      {' '}initial {detail?.network.initial ?? '—'}
+      {detail?.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
+      {detail?.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
+      {detail && detail.ports.length > 0 ? <Text color={theme.dim}> · ports {detail.ports.join(', ')}</Text> : null}
+    </Text>,
+  );
+  return rows;
+}
+
 function ProcessView({
   app,
   stats,
   detail,
+  viewport,
+  scroll,
 }: {
   app?: DokkuApp;
   stats: StatsMap | null;
   detail?: AppDetail;
+  viewport: number;
+  scroll: number;
 }): ReactNode {
   if (!app) return <Text color={theme.dim}>No app selected.</Text>;
+  const rows = processRows(app, stats, detail);
+  // Reserve a row for the hint when the pane overflows, the same way the
+  // cheat sheet does — overflowing the box makes Yoga squeeze the column and
+  // collapse arbitrary rows instead of clipping the end.
+  const shown = rows.length > viewport ? Math.max(1, viewport - 1) : viewport;
+  const start = Math.min(scroll, Math.max(0, rows.length - shown));
   return (
     <Box flexDirection="column">
-      <AppHeader app={app} stats={stats} extra={`   restart ${app.restartPolicy || '—'}`} />
-      <Text color={theme.dim}>PROCESSES</Text>
-      {app.processes.length === 0 ? <Text color={theme.dim}> No process info (not deployed?)</Text> : null}
-      {app.processes.map((p) => (
-        <Box key={p.type} flexDirection="column">
-          <Text bold>
-            {' '}
-            {p.type} <Text color={theme.dim}>scale {p.scale}</Text>
-          </Text>
-          {p.instances.map((inst) => {
-            const s = stats?.[`${app.name}.${p.type}.${inst.index}`];
-            return (
-              <Text key={inst.index} wrap="truncate-end">
-                {'   '}
-                {p.type}.{inst.index}{'  '}
-                <Text color={statusColor(inst.status)}>{inst.status}</Text>
-                {s ? (
-                  <Text color={theme.dim}>
-                    {'  '}cpu {fmtPct(s.cpuPct)} · mem {fmtBytes(s.memBytes)}
-                    {s.memLimitBytes ? ` / ${fmtBytes(s.memLimitBytes)}` : ''}
-                  </Text>
-                ) : null}
-              </Text>
-            );
-          })}
-        </Box>
-      ))}
-      <Text> </Text>
-      <Text color={theme.dim}>DEPLOY</Text>
-      <Text wrap="truncate-end">
-        {' '}via {app.deploySource || '—'}
-        {detail?.git.sourceImage ? ` · image ${detail.git.sourceImage}` : ''}
-        {detail && !detail.git.sourceImage && (detail.git.branch || detail.git.sha)
-          ? ` · branch ${detail.git.branch ?? '—'} · sha ${detail.git.sha ? detail.git.sha.slice(0, 10) : '—'} · deployed ${fmtDate(detail.git.lastUpdated)}`
-          : ''}
-        <Text color={theme.dim}> · created {fmtDate(app.createdAt)}</Text>
-      </Text>
-      <Text> </Text>
-      <Text color={theme.dim}>NETWORK</Text>
-      <Text wrap="truncate-end">
-        {' '}initial {detail?.network.initial ?? '—'}
-        {detail?.network.attachPostCreate ? ` · post-create ${detail.network.attachPostCreate}` : ''}
-        {detail?.network.attachPostDeploy ? ` · post-deploy ${detail.network.attachPostDeploy}` : ''}
-        {detail && detail.ports.length > 0 ? <Text color={theme.dim}> · ports {detail.ports.join(', ')}</Text> : null}
-      </Text>
+      {rows.slice(start, start + shown)}
+      {scrollHint(rows.length, start, shown)}
     </Box>
   );
 }
@@ -961,6 +1111,7 @@ function HelpView(): ReactNode {
     ['s', 'reveal/hide secrets (Config values, service DSN)'],
     null,
     ['R / S / B', 'prefill restart / stop / rebuild for the selected app (enter confirms)'],
+    ['F / I', 'prefill logs:failed / ps:inspect for the selected app'],
     [':', 'type any dokku command ($app → selected app, ↑↓ history)'],
     ['r', 'refresh now (full report sweep)'],
     ['q / ctrl-c', 'quit'],
@@ -1158,9 +1309,11 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // on the next look.
   const [dataV, setDataV] = useState(0);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  // Surfaced in the header: a refresh that threw used to fail silently.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [configCache, setConfigCache] = useState<Record<string, { vars: Record<string, string>; v: number }>>({});
   const [configLoading, setConfigLoading] = useState(false);
-  const [services, setServices] = useState<{ list: DokkuService[]; v: number } | null>(null);
+  const [services, setServices] = useState<{ list: DokkuService[]; v: number; at: number } | null>(null);
   const [servicesLoading, setServicesLoading] = useState(false);
   const [detailCache, setDetailCache] = useState<Record<string, { detail: AppDetail; v: number }>>({});
   const [detailLoading, setDetailLoading] = useState(false);
@@ -1208,23 +1361,66 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     dataRef.current = data;
   }, [data]);
   const refreshInFlight = useRef(false);
+  const firstLoadDone = useRef(false);
   const refresh = useCallback(async (mode: 'full' | 'light' = 'full') => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     setRefreshing(true);
-    const prev = dataRef.current;
-    const light = mode === 'light' && prev !== null;
-    const [result, statsResult] = await Promise.all([
-      light ? loadOverviewLight(prev!) : loadOverview(),
-      loadStats(),
-    ]);
-    setData(result);
-    setStats(statsResult);
-    if (!light) setDataV((v) => v + 1);
-    setLastUpdated(Date.now());
-    setLoading(false);
-    setRefreshing(false);
-    refreshInFlight.current = false;
+    // try/finally is load-bearing: without it a single throw left the
+    // in-flight flag stuck true, which killed the poll timer, `r` and the
+    // events watcher for the rest of the session with no visible error.
+    try {
+      const prev = dataRef.current;
+      const light = mode === 'light' && prev !== null;
+      const result = light ? await loadOverviewLight(prev!) : await loadOverview();
+      setData(result);
+      // The very first load must not bump dataV. Every lazy loader tags its
+      // cache entry with the dataV it fetched under, so bumping here threw
+      // away and re-fetched everything that was in flight during startup
+      // (services were fetched twice on every launch).
+      if (!light && firstLoadDone.current) setDataV((v) => v + 1);
+      firstLoadDone.current = true;
+      setLastUpdated(Date.now());
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || String(e));
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+      refreshInFlight.current = false;
+    }
+  }, []);
+
+  // Container metrics are sampled on their own timer. `docker stats
+  // --no-stream` waits out a full sampling interval (~2s), so awaiting it
+  // alongside the overview delayed every paint — the first one included — by
+  // that much, and held the header's ↻ spinner on for the whole poll.
+  const statsInFlight = useRef(false);
+  const sampleStats = useRef<() => void>(() => {});
+  useEffect(() => {
+    let cancelled = false;
+    const sample = async () => {
+      if (statsInFlight.current) return;
+      statsInFlight.current = true;
+      try {
+        const s = await loadStats();
+        if (!cancelled) setStats(s);
+      } catch {
+        // Metrics are a nicety — keep showing the last sample.
+      } finally {
+        statsInFlight.current = false;
+      }
+    };
+    sampleStats.current = () => void sample();
+    void sample();
+    if (!STATS_SECONDS) return () => {
+      cancelled = true;
+    };
+    const t = setInterval(() => void sample(), STATS_SECONDS * 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
 
   useEffect(() => {
@@ -1313,6 +1509,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       flushNow();
       setCmdRun((r) => (r ? { ...r, running: false } : r));
       void refresh('full'); // the command may have changed state — show it
+      sampleStats.current();
     });
     cmdStopRef.current = () => {
       clearInterval(flush);
@@ -1323,12 +1520,17 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // Kill a still-running command if the whole app unmounts.
   useEffect(() => () => cmdStopRef.current?.(), []);
 
-  // 1s tick so the "↻ 12s" freshness readout in the header stays honest.
+  // Tick the header's "↻ 12s" freshness readout. Every tick repaints the whole
+  // frame, so the cadence follows what the readout can actually show: 1s while
+  // it counts single seconds, 5s once it's rounded to five (see shownAge),
+  // 30s once it only shows whole minutes.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
+    const age = lastUpdated === null ? 0 : (Date.now() - lastUpdated) / 1000;
+    const period = age < 10 ? 1000 : age < 60 ? 5000 : 30000;
+    const t = setTimeout(() => setNow(Date.now()), period);
+    return () => clearTimeout(t);
+  }, [now, lastUpdated]);
 
   useEffect(() => {
     setScroll(0);
@@ -1357,9 +1559,17 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // Buffers are cached per app so coming back within the TTL shows history
   // instantly; the re-attach replay (`-n 100`) is deduped by timestamp.
   const logCache = useRef(new Map<string, { lines: LogLine[]; at: number }>());
+  // Drop buffers past their TTL rather than keeping every app ever visited.
+  const pruneLogCache = useCallback(() => {
+    const now = Date.now();
+    for (const [app, entry] of logCache.current) {
+      if (now - entry.at > LOG_CACHE_TTL_MS) logCache.current.delete(app);
+    }
+  }, []);
   const logApp = currentView.key === 'logs' ? currentApp?.name : undefined;
   useEffect(() => {
     if (!logApp) return;
+    pruneLogCache();
     const cached = logCache.current.get(logApp);
     const seed = cached && Date.now() - cached.at < LOG_CACHE_TTL_MS ? cached.lines : [];
     setLogLines(seed);
@@ -1388,15 +1598,25 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         return capped;
       });
     }, 150);
-    const stop = tailLogs(logApp, source, push, (msg) => push(msg, true));
+
+    // Attaching is debounced: every selection change used to kill the old
+    // `dokku logs -t` and spawn a new one (plus its 100-line replay), so
+    // holding ↓ through the list spawned one tail per row. The cached seed is
+    // shown immediately regardless, so the pane still fills instantly.
+    let stop: (() => void) | null = null;
+    const attach = setTimeout(() => {
+      stop = tailLogs(logApp, source, push, (msg) => push(msg, true));
+    }, LOG_ATTACH_DEBOUNCE_MS);
+
     return () => {
+      clearTimeout(attach);
       clearInterval(flush);
-      stop();
+      stop?.();
       // TTL counts from when we left the view, not from the last log line.
       const cur = logCache.current.get(logApp);
       if (cur) cur.at = Date.now();
     };
-  }, [logApp, source]);
+  }, [logApp, source, pruneLogCache]);
 
   // Lazily load config for the selected app when on the config view. An entry
   // fetched under an older dataV refetches silently (stale values stay on
@@ -1407,13 +1627,19 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     if (entry && entry.v === dataV) return;
     let cancelled = false;
     if (!entry) setConfigLoading(true);
-    void loadConfig(currentApp.name, source).then((res) => {
-      if (cancelled) return;
-      setConfigCache((c) => ({ ...c, [currentApp.name]: { vars: res.vars, v: dataV } }));
-      setConfigLoading(false);
-    });
+    // Debounced like the detail loader: holding ↓ through the app list used to
+    // fire a `config:show` per row. The cancelled flag only dropped the
+    // result — the subprocess had already run.
+    const t = setTimeout(() => {
+      void loadConfig(currentApp.name, source).then((res) => {
+        if (cancelled) return;
+        setConfigCache((c) => ({ ...c, [currentApp.name]: { vars: res.vars, v: dataV } }));
+        setConfigLoading(false);
+      });
+    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
     return () => {
       cancelled = true;
+      clearTimeout(t);
     };
   }, [currentView.key, currentApp, source, configCache, dataV]);
 
@@ -1421,12 +1647,15 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // plus the Apps summary pane's LINKED line); refetch when dataV moves.
   useEffect(() => {
     if (currentView.key !== 'services' && currentView.key !== 'apps') return;
-    if (services && services.v === dataV) return;
+    // A dataV bump alone isn't worth the sweep this costs (plugin:list, one
+    // <plugin>:list per plugin, one <plugin>:info per service) — services only
+    // change when someone creates or links one, so hold them for a TTL.
+    if (services && (services.v === dataV || Date.now() - services.at < SERVICES_TTL_MS)) return;
     let cancelled = false;
     if (!services) setServicesLoading(true);
     void loadServices().then((res) => {
       if (cancelled) return;
-      setServices({ list: res.services, v: dataV });
+      setServices({ list: res.services, v: dataV, at: Date.now() });
       setServicesLoading(false);
     });
     return () => {
@@ -1451,7 +1680,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         setDetailCache((c) => ({ ...c, [currentApp.name]: { detail: d, v: dataV } }));
         setDetailLoading(false);
       });
-    }, entry ? 0 : 200);
+    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
     return () => {
       cancelled = true;
       clearTimeout(t);
@@ -1482,7 +1711,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
 
   // Prefill a quick action into the `:` prompt (never auto-runs).
   const quickAction = (ch: string): boolean => {
-    const cmd = QUICK_ACTIONS[ch];
+    const cmd = QUICK_ACTIONS[ch] ?? SAFE_ACTIONS[ch];
     if (!cmd || !currentApp) return false;
     setCmdInput(cmd);
     return true;
@@ -1667,6 +1896,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     }
     if (input === 'r') {
       void refresh('full');
+      sampleStats.current();
       return;
     }
     if (input === 's' && currentView.key === 'config') {
@@ -1708,6 +1938,8 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         } else if (currentView.key === 'config') {
           const total = currentApp ? Object.keys(configCache[currentApp.name]?.vars || {}).length : 0;
           clampScroll(scrollDown ? 1 : -1, total);
+        } else if (currentView.key === 'process' && currentApp) {
+          clampScroll(scrollDown ? 1 : -1, processRows(currentApp, statsMap, currentDetail).length);
         }
       }
       return;
@@ -1748,7 +1980,15 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       );
       break;
     case 'process':
-      content = <ProcessView app={currentApp} stats={statsMap} detail={currentDetail} />;
+      content = (
+        <ProcessView
+          app={currentApp}
+          stats={statsMap}
+          detail={currentDetail}
+          viewport={detailViewport}
+          scroll={scroll}
+        />
+      );
       break;
     case 'config':
       content = (
@@ -1822,6 +2062,10 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     );
 
   const activeFilter = currentView.perApp ? appFilterLive : '';
+  // Rounded the same way the ticker above is paced, so the readout never shows
+  // a number it isn't refreshing often enough to keep true.
+  const rawAge = lastUpdated === null ? null : Math.max(0, Math.round((now - lastUpdated) / 1000));
+  const shownAge = rawAge === null || rawAge < 10 ? rawAge : rawAge < 60 ? Math.floor(rawAge / 5) * 5 : rawAge;
   return (
     <Box flexDirection="column" height={rows}>
       <Header
@@ -1831,8 +2075,9 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         cert={soonestCert(allApps)}
         disk={stats?.disk ?? null}
         refreshing={refreshing && !loading}
-        age={lastUpdated !== null ? Math.max(0, Math.round((now - lastUpdated) / 1000)) : null}
+        age={shownAge}
         update={update}
+        error={loadError}
       />
       {overlayTitle ? (
         <Box flexGrow={1} flexDirection="column" overflow="hidden" borderStyle="round" borderColor={theme.dim} paddingX={2}>

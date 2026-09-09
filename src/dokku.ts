@@ -28,6 +28,7 @@ import type {
   ProcInstance,
   Process,
   RawReport,
+  ResourceEntry,
   ServicesResult,
   Source,
   Ssl,
@@ -41,19 +42,25 @@ const execFileAsync = promisify(execFile);
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
-let _hasDokku: boolean | null = null;
+// Memoized as a *promise*, not a result: loadOverview, loadStats and the lazy
+// loaders all probe concurrently on startup, and caching only the resolved
+// value let every one of them spawn its own `dokku version` — three SSH
+// handshakes, one of which pays the cold ControlMaster setup.
+let _hasDokku: Promise<boolean> | null = null;
 
 export async function hasDokku(): Promise<boolean> {
   if (process.env.DOKKU_INK_DEMO === "1") return false;
-  if (_hasDokku !== null) return _hasDokku;
-  try {
-    const inv = dokkuInvocation(["version"]);
-    // SSH cold-start (handshake + auth) can exceed a local-tuned timeout.
-    await execFileAsync(inv.cmd, inv.argv, { timeout: isRemote() ? 15000 : 8000 });
-    _hasDokku = true;
-  } catch {
-    _hasDokku = false;
-  }
+  if (_hasDokku) return _hasDokku;
+  _hasDokku = (async () => {
+    try {
+      const inv = dokkuInvocation(["version"]);
+      // SSH cold-start (handshake + auth) can exceed a local-tuned timeout.
+      await execFileAsync(inv.cmd, inv.argv, { timeout: isRemote() ? 15000 : 8000 });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
   return _hasDokku;
 }
 
@@ -96,9 +103,9 @@ async function rawExec(
 }
 
 // Like dokku() but never throws — captures stdout/stderr/error for diagnostics.
-async function dokkuRaw(args: string[]): Promise<RawResult> {
+async function dokkuRaw(args: string[], timeout = 20000): Promise<RawResult> {
   const inv = dokkuInvocation(args);
-  return rawExec(inv.cmd, inv.argv);
+  return rawExec(inv.cmd, inv.argv, timeout);
 }
 
 // Host-level command (docker, df). Resolves to a failed result when the
@@ -134,10 +141,105 @@ function parseAppNames(out: string): string[] {
   return names;
 }
 
-// Fetch a single app's `--format json` report. On Dokku 0.38+ the no-arg form
-// emits one JSON object *per app per line* (NDJSON) with no app key, which is
-// ambiguous to map back; calling per app returns one clean object we can attach
-// to that exact app. Returns undefined when the command errors or isn't JSON.
+// The report plugins fetched for every app on a full sweep. Each one is a
+// single batched invocation (see reportAllApps), so adding a plugin here costs
+// one command per refresh, not one per app.
+const SWEEP_PLUGINS = [
+  "apps",
+  "ps",
+  "domains",
+  "certs",
+  "checks",
+  "proxy",
+  "cron",
+] as const;
+
+type SweepPlugin = (typeof SWEEP_PLUGINS)[number];
+export type SweepReports = Record<SweepPlugin, RawReport>;
+
+// Fetch every app's `<plugin>:report --format json` in ONE invocation.
+//
+// The no-arg form emits one JSON object per app per line (NDJSON) with no app
+// key in it, so the objects have to be matched back by position. That is safe:
+// every plugin's report command iterates common.DokkuApps(), which is an
+// os.ReadDir of DOKKU_ROOT — the same deterministic order `apps:list` returns.
+// loadOverview still verifies the row count (and the app names, which
+// apps:report carries in its `dir` key) before trusting the alignment, and
+// falls back to per-app calls when anything disagrees.
+//
+// Returns null when the command failed or emitted something unparseable.
+async function reportAllApps(
+  plugin: string,
+): Promise<Array<Record<string, string>> | null> {
+  // A batched report does N apps' worth of work in one call, so it needs more
+  // headroom than a single-app one.
+  const r = await dokkuRaw([`${plugin}:report`, "--format", "json"], 40000);
+  if (!r.ok) return null;
+  const rows: Array<Record<string, string>> = [];
+  for (const line of r.stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue; // skips the "no apps exist" warning
+    try {
+      const obj = JSON.parse(t);
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+      rows.push(obj as Record<string, string>);
+    } catch {
+      return null;
+    }
+  }
+  return rows;
+}
+
+// Match batched NDJSON rows onto app names by position. null when the row
+// count disagrees with the app list — the caller then re-fetches per app.
+function alignRows(
+  names: string[],
+  rows: Array<Record<string, string>> | null,
+): Record<string, Record<string, string>> | null {
+  if (!rows || rows.length !== names.length) return null;
+  const out: Record<string, Record<string, string>> = {};
+  names.forEach((n, i) => (out[n] = rows[i]));
+  return out;
+}
+
+// App names as carried by apps:report itself: its `dir` key is
+// $DOKKU_ROOT/<app>. Returns null unless every row has one, which is what
+// makes the batched apps report self-identifying rather than order-dependent.
+export function namesFromAppsRows(
+  rows: Array<Record<string, string>> | null,
+): string[] | null {
+  if (!rows || rows.length === 0) return null;
+  const names: string[] = [];
+  for (const row of rows) {
+    const dir = pick(row, "dir", "app-dir");
+    if (!dir) return null;
+    const base = dir.replace(/\/+$/, "").split("/").pop();
+    if (!base) return null;
+    names.push(base);
+  }
+  return names;
+}
+
+const sameNames = (a: string[], b: string[]): boolean =>
+  a.length === b.length && [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
+
+// Per-app fallback for one plugin: the old N-invocations-per-report path, used
+// only when the batched call failed or its rows could not be aligned.
+async function reportPerApp(
+  plugin: string,
+  names: string[],
+): Promise<Record<string, Record<string, string>>> {
+  const out: Record<string, Record<string, string>> = {};
+  await mapLimit(names, 8, async (name) => {
+    const rep = await reportForApp(plugin, name);
+    if (rep) out[name] = rep;
+  });
+  return out;
+}
+
+// Fetch a single app's `--format json` report — the fallback path, and what
+// the per-app drill-in (ports/git/network/resource) still uses.
+// Returns undefined when the command errors or isn't JSON.
 async function reportForApp(
   plugin: string,
   app: string,
@@ -258,55 +360,83 @@ export async function loadOverview(): Promise<Overview> {
   }
 
   const warnings: string[] = [];
-  let names: string[] = [];
 
-  // App names from `dokku apps:list` (header-tolerant parsing; no --quiet needed).
-  const listed = await dokkuRaw(["apps:list"]);
+  // One batched call per plugin, plus apps:list — all in parallel, and all
+  // flat in the number of apps (a 12-app host used to need 49 invocations
+  // here, a 30-app host 121).
+  const [listed, ...batched] = await Promise.all([
+    // --format json is the clean shape; the text parser stays as a fallback
+    // for dokku builds that reject the flag on apps:list.
+    dokkuRaw(["apps:list", "--format", "json"]),
+    ...SWEEP_PLUGINS.map((plugin) => reportAllApps(plugin)),
+  ]);
+  const rows = Object.fromEntries(
+    SWEEP_PLUGINS.map((plugin, i) => [plugin, batched[i]]),
+  ) as Record<SweepPlugin, Array<Record<string, string>> | null>;
+
+  let names: string[] = [];
   if (listed.ok) {
-    names = parseAppNames(listed.stdout);
+    names = parseAppList(listed.stdout);
   } else {
-    warnings.push(`apps:list failed: ${listed.error ?? listed.stderr}`);
+    const retry = await dokkuRaw(["apps:list"]);
+    if (retry.ok) names = parseAppNames(retry.stdout);
+    else warnings.push(`apps:list failed: ${retry.error ?? retry.stderr}`);
   }
 
-  // Fetch each report per app (see reportForApp) and key the results by app.
-  const appsRep: Record<string, Record<string, string>> = {};
-  const psRep: Record<string, Record<string, string>> = {};
-  const domRep: Record<string, Record<string, string>> = {};
-  const certRep: Record<string, Record<string, string>> = {};
+  // Cross-check the batched alignment against the names apps:report carries
+  // in its own `dir` key. If those disagree with apps:list, the positional
+  // mapping cannot be trusted for any plugin and we fall back per app.
+  const reported = namesFromAppsRows(rows.apps);
+  let trustOrder = true;
+  if (reported && !sameNames(reported, names)) {
+    if (names.length === 0) {
+      names = reported; // apps:list failed; the report can still name them
+    } else {
+      trustOrder = false;
+      warnings.push(
+        "batched reports disagreed with apps:list — fell back to per-app reports",
+      );
+    }
+  }
+  if (reported && trustOrder) names = reported;
 
-  // Each worker fires 4 reports in parallel, so this is up to 16 concurrent
-  // dokku invocations — plenty, without hammering the host.
-  await mapLimit(names, 4, async (name) => {
-    const [a, ps, dom, cert] = await Promise.all([
-      reportForApp("apps", name),
-      reportForApp("ps", name),
-      reportForApp("domains", name),
-      reportForApp("certs", name),
-    ]);
-    if (a) appsRep[name] = a;
-    if (ps) psRep[name] = ps;
-    if (dom) domRep[name] = dom;
-    if (cert) certRep[name] = cert;
-  });
+  const reports = {} as SweepReports;
+  await Promise.all(
+    SWEEP_PLUGINS.map(async (plugin) => {
+      const aligned = trustOrder ? alignRows(names, rows[plugin]) : null;
+      reports[plugin] = aligned ?? (await reportPerApp(plugin, names));
+    }),
+  );
 
-  const apps = buildApps(names, appsRep, psRep, domRep, certRep);
-  return { apps, source: "dokku", warnings };
+  return { apps: buildApps(names, reports), source: "dokku", warnings };
+}
+
+// `dokku apps:list --format json` -> ["blog", "staging"]. Falls back to the
+// text parser when the output isn't the expected JSON array.
+export function parseAppList(out: string): string[] {
+  const t = out.trim();
+  if (t.startsWith("[")) {
+    try {
+      const arr = JSON.parse(t);
+      if (Array.isArray(arr)) return arr.filter((n): n is string => typeof n === "string");
+    } catch {
+      /* fall through to the text parser */
+    }
+  }
+  return parseAppNames(out);
 }
 
 // Pure normalisation from raw dokku JSON reports into the app model.
 // Exported so it can be unit-tested against sample dokku output.
-export function buildApps(
-  names: string[],
-  appsRep: RawReport,
-  psRep: RawReport,
-  domRep: RawReport,
-  certRep: RawReport,
-): DokkuApp[] {
+export function buildApps(names: string[], reports: Partial<SweepReports>): DokkuApp[] {
+  const at = (plugin: SweepPlugin, name: string): Record<string, string> =>
+    (reports[plugin] && reports[plugin]![name]) || {};
+
   return names.map((name) => {
-    const a = (appsRep && appsRep[name]) || {};
-    const ps = (psRep && psRep[name]) || {};
-    const dom = (domRep && domRep[name]) || {};
-    const cert = (certRep && certRep[name]) || {};
+    const a = at("apps", name);
+    const ps = at("ps", name);
+    const dom = at("domains", name);
+    const cert = at("certs", name);
 
     const runningRaw = pick(ps, "running");
     const appEnabled = pick(dom, "app-enabled");
@@ -322,25 +452,69 @@ export function buildApps(
       domains: splitHosts(pick(dom, "app-vhosts")),
       domainsEnabled: appEnabled === undefined ? null : toBool(appEnabled),
       ssl: normalizeCerts(cert),
+      locked: toBool(pick(a, "locked", "app-locked")),
+      checks: normalizeChecks(reports.checks?.[name]),
+      proxy: normalizeProxy(reports.proxy?.[name]),
+      cronTasks: parseCount(pick(reports.cron?.[name], "task-count", "cron-task-count")),
     };
   });
 }
 
+// `checks:report` reports disabled/skipped process types as space-separated
+// lists, with "none" standing in for an empty one. `_all_` means every type.
+function normalizeChecks(
+  entry: Record<string, string> | undefined,
+): DokkuApp["checks"] {
+  if (!entry) return null;
+  const list = (...keys: string[]): string[] => {
+    const raw = pick(entry, ...keys);
+    if (!raw || /^none$/i.test(raw.trim())) return [];
+    return splitHosts(raw);
+  };
+  return {
+    disabled: list("disabled-list", "checks-disabled-list"),
+    skipped: list("skipped-list", "checks-skipped-list"),
+  };
+}
+
+// `proxy:report` — prefer the computed values (per-app, else global, else the
+// built-in default), which is what actually applies at deploy time.
+function normalizeProxy(
+  entry: Record<string, string> | undefined,
+): DokkuApp["proxy"] {
+  if (!entry) return null;
+  const enabled = pick(entry, "enabled", "proxy-enabled");
+  return {
+    type: pick(entry, "computed-type", "type", "proxy-computed-type", "proxy-type") ?? null,
+    enabled: enabled === undefined ? null : toBool(enabled),
+    port: pick(entry, "computed-proxy-port", "proxy-port", "proxy-computed-proxy-port") ?? null,
+    sslPort:
+      pick(entry, "computed-proxy-ssl-port", "proxy-ssl-port", "proxy-computed-proxy-ssl-port") ??
+      null,
+  };
+}
+
+function parseCount(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 // Cheap refresh between full ones: only ps:report changes minute-to-minute,
-// so re-fetch just that and graft it onto the previous snapshot. Domains,
-// certs and app metadata only move on deploys/config changes, which trigger
-// a full refresh via the events watcher anyway.
+// so re-fetch just that (one batched call) and graft it onto the previous
+// snapshot. Domains, certs and app metadata only move on deploys/config
+// changes, which trigger a full refresh via the events watcher anyway.
 export async function loadOverviewLight(prev: Overview): Promise<Overview> {
   if (prev.source !== "dokku" || !(await hasDokku())) return loadOverview();
-  const psRep: Record<string, Record<string, string>> = {};
-  await mapLimit(
-    prev.apps.map((a) => a.name),
-    8,
-    async (name) => {
-      const ps = await reportForApp("ps", name);
-      if (ps) psRep[name] = ps;
-    },
-  );
+  const names = prev.apps.map((a) => a.name);
+  const rows = await reportAllApps("ps");
+  // Two different failures, two different answers: a row count that disagrees
+  // with the previous snapshot means an app was created or destroyed, so the
+  // whole snapshot is stale and needs the full sweep. A batched report this
+  // host simply can't serve just means falling back to one call per app —
+  // escalating to a full refresh every poll would be far more expensive.
+  if (rows && rows.length !== names.length) return loadOverview();
+  const psRep = alignRows(names, rows) ?? (await reportPerApp("ps", names));
   const apps = prev.apps.map((a) => {
     const ps = psRep[a.name];
     if (!ps) return a;
@@ -354,22 +528,21 @@ export async function loadOverviewLight(prev: Overview): Promise<Overview> {
       processes: parseProcesses(ps),
     };
   });
-  return { apps, source: "dokku", warnings: [] };
+  return { apps, source: "dokku", warnings: prev.warnings };
 }
 
 // ---------------------------------------------------------------------------
 // Container metrics (docker stats) + host disk
 // ---------------------------------------------------------------------------
 
-let _hasDocker: boolean | null = null;
+let _hasDocker: Promise<boolean> | null = null;
 
 async function hasDocker(): Promise<boolean> {
-  if (_hasDocker !== null) return _hasDocker;
-  const r = await hostRaw(
+  if (_hasDocker) return _hasDocker;
+  _hasDocker = hostRaw(
     ["docker", "version", "--format", "{{.Server.Version}}"],
     10000,
-  );
-  _hasDocker = r.ok;
+  ).then((r) => r.ok);
   return _hasDocker;
 }
 
@@ -589,6 +762,86 @@ export async function loadServices(): Promise<ServicesResult> {
 // Per-app drill-in detail (ports, storage, git, network)
 // ---------------------------------------------------------------------------
 
+// `resource:report --format json` keys are "<proctype>.<limit|reserve>.<key>",
+// e.g. "web.limit.memory": "512m". Only *set* properties are reported, so an
+// app with no limits configured yields an empty list. "_default_" is dokku's
+// app-wide fallback process type.
+export function buildResources(
+  entry: Record<string, string> | undefined,
+): ResourceEntry[] {
+  if (!entry) return [];
+  const byType = new Map<string, ResourceEntry>();
+  for (const [key, value] of Object.entries(entry)) {
+    const m = /^(?:resource-)?(.+)\.(limit|reserve)\.(.+)$/.exec(key);
+    if (!m || !value) continue;
+    const [, processType, kind, prop] = m;
+    let e = byType.get(processType);
+    if (!e) {
+      e = { processType, limits: {}, reserves: {} };
+      byType.set(processType, e);
+    }
+    (kind === "limit" ? e.limits : e.reserves)[prop] = String(value);
+  }
+  return [...byType.values()].sort((a, b) => {
+    // "_default_" is the fallback for every other type — list it last.
+    if (a.processType === "_default_") return 1;
+    if (b.processType === "_default_") return -1;
+    return a.processType.localeCompare(b.processType);
+  });
+}
+
+// `ps:scale <app> --format json` -> [{"process_type":"web","quantity":2}].
+// This is the *desired* formation, which is what makes a missing container
+// visible: the live instance list alone reads as "web ×1" whether the app is
+// scaled to 1 or scaled to 3 with two of them dead.
+export function parseScale(out: string): Record<string, number> {
+  const t = out.trim();
+  if (!t.startsWith("[")) return {};
+  let arr: unknown;
+  try {
+    arr = JSON.parse(t);
+  } catch {
+    return {};
+  }
+  if (!Array.isArray(arr)) return {};
+  const scale: Record<string, number> = {};
+  for (const row of arr) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const type = typeof r.process_type === "string" ? r.process_type : null;
+    const qty = Number(r.quantity);
+    if (type && Number.isFinite(qty)) scale[type] = qty;
+  }
+  return scale;
+}
+
+// `storage:list <app> --format json` -> ["host:container", …], matching the
+// text form buildAppDetail already renders. Dokku 0.38 made volumes named
+// first-class entries, so an entry may carry a name and mount options that the
+// old "host:container" text form never showed. null when the output isn't the
+// expected JSON array (older dokku: fall back to parsing the text).
+export function parseStorageJson(out: string): string[] | null {
+  const t = out.trim();
+  if (!t.startsWith("[")) return null;
+  let arr: unknown;
+  try {
+    arr = JSON.parse(t);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr)) return null;
+  return arr.flatMap((row) => {
+    if (!row || typeof row !== "object") return [];
+    const r = row as Record<string, unknown>;
+    const host = typeof r.host_path === "string" ? r.host_path : "";
+    const container = typeof r.container_path === "string" ? r.container_path : "";
+    if (!host && !container) return [];
+    const name = typeof r.entry_name === "string" && r.entry_name ? `${r.entry_name} ` : "";
+    const ro = r.readonly === true ? ":ro" : "";
+    return [`${name}${host}:${container}${ro}`];
+  });
+}
+
 // Pure assembly from raw report objects — exported for tests. Report JSON
 // keys vary across dokku versions between plugin-prefixed and bare names, so
 // pick() both.
@@ -597,6 +850,8 @@ export function buildAppDetail(
   git: Record<string, string> | undefined,
   network: Record<string, string> | undefined,
   storageOut: string,
+  resource?: Record<string, string>,
+  scaleOut?: string,
 ): AppDetail {
   const portList = splitHosts(
     pick(ports, "map", "ports-map") ?? pick(ports, "map-detected", "ports-map-detected"),
@@ -610,6 +865,8 @@ export function buildAppDetail(
   return {
     ports: portList,
     storage,
+    resources: buildResources(resource),
+    scale: parseScale(scaleOut ?? ""),
     git: {
       branch: pick(git, "deploy-branch", "git-deploy-branch") ?? null,
       sha: pick(git, "sha", "git-sha") ?? null,
@@ -636,13 +893,31 @@ export async function loadAppDetail(
       DEMO.details[appName] ?? buildAppDetail(undefined, undefined, undefined, ""),
     );
   }
-  const [ports, git, network, storage] = await Promise.all([
+  const [ports, git, network, resource, storage, scale] = await Promise.all([
     reportForApp("ports", appName),
     reportForApp("git", appName),
     reportForApp("network", appName),
-    dokkuRaw(["storage:list", appName]),
+    reportForApp("resource", appName),
+    dokkuRaw(["storage:list", appName, "--format", "json"]),
+    dokkuRaw(["ps:scale", appName, "--format", "json"]),
   ]);
-  return buildAppDetail(ports, git, network, storage.ok ? storage.stdout : "");
+  const storageOut = storage.ok ? storage.stdout : "";
+  const detail = buildAppDetail(
+    ports,
+    git,
+    network,
+    storageOut,
+    resource,
+    scale.ok ? scale.stdout : "",
+  );
+  const asJson = parseStorageJson(storageOut);
+  if (asJson) detail.storage = asJson;
+  else if (!storage.ok) {
+    // Older dokku rejects --format on storage:list; retry the text form.
+    const text = await dokkuRaw(["storage:list", appName]);
+    if (text.ok) detail.storage = buildAppDetail(undefined, undefined, undefined, text.stdout).storage;
+  }
+  return detail;
 }
 
 // Per-app environment variables.
@@ -909,8 +1184,36 @@ export async function runDoctor(): Promise<string> {
       ? ov.apps.find((a) => a.running)?.name
       : undefined) ?? names[0];
 
-  // Probe the actual strategy: per-app `<plugin>:report <app> --format json`.
-  for (const plugin of ["apps", "ps", "domains", "certs"]) {
+  // Probe the batched strategy first: one `<plugin>:report --format json` per
+  // plugin for every app at once. This is the path a normal refresh takes, so
+  // if it misbehaves on this host the doctor should say so — the dashboard
+  // will silently fall back to per-app reports and just be slower.
+  L.push("# batched reports (`<plugin>:report --format json`, no app)");
+  for (const plugin of SWEEP_PLUGINS) {
+    const rows = await reportAllApps(plugin);
+    if (rows === null) {
+      L.push(`  ${plugin}: FAILED — falls back to one report per app`);
+      continue;
+    }
+    const aligns = rows.length === names.length;
+    L.push(
+      `  ${plugin}: OK — ${rows.length} row(s)${
+        aligns ? "" : ` — does NOT match ${names.length} app(s), falls back per app`
+      }`,
+    );
+  }
+  const reportedNames = namesFromAppsRows(await reportAllApps("apps"));
+  L.push(
+    reportedNames
+      ? `  apps:report names itself via \`dir\`: ${reportedNames.join(", ") || "(none)"}${
+          sameNames(reportedNames, names) ? " (matches apps:list)" : " (DISAGREES with apps:list)"
+        }`
+      : "  apps:report has no `dir` key — app names come from apps:list alone",
+  );
+  L.push("");
+
+  // Probe the per-app fallback: `<plugin>:report <app> --format json`.
+  for (const plugin of ["apps", "ps", "domains", "certs", "checks", "proxy", "cron"]) {
     if (!probe) break;
     const r = await dokkuRaw([`${plugin}:report`, probe, "--format", "json"]);
     let verdict: string;

@@ -20,6 +20,22 @@ export interface Ssl {
   verified: boolean | null;
 }
 
+/** Zero-downtime check state from `checks:report`. */
+export interface Checks {
+  /** Process types with checks turned off entirely ("_all_" = every type). */
+  disabled: string[];
+  /** Process types whose checks are skipped (deploy proceeds unchecked). */
+  skipped: string[];
+}
+
+/** Routing facts from `proxy:report` — the layer in front of the containers. */
+export interface Proxy {
+  type: string | null;
+  enabled: boolean | null;
+  port: string | null;
+  sslPort: string | null;
+}
+
 export interface DokkuApp {
   name: string;
   running: boolean | null;
@@ -31,6 +47,12 @@ export interface DokkuApp {
   domains: string[];
   domainsEnabled: boolean | null;
   ssl: Ssl | null;
+  /** `apps:report` locked — deploys are refused while true. */
+  locked: boolean;
+  checks: Checks | null;
+  proxy: Proxy | null;
+  /** `cron:report` task-count — scheduled tasks from app.json. */
+  cronTasks: number | null;
 }
 
 export type Source = 'dokku' | 'demo';
@@ -77,10 +99,21 @@ export interface ServicesResult {
   source: Source;
 }
 
+/** One `resource:limit`/`resource:reserve` entry for a process type. */
+export interface ResourceEntry {
+  /** Process type, or "_default_" for the app-wide fallback. */
+  processType: string;
+  limits: Record<string, string>;
+  reserves: Record<string, string>;
+}
+
 /** Lazily-fetched extras for the per-app drill-in view. */
 export interface AppDetail {
   ports: string[];
   storage: string[];
+  resources: ResourceEntry[];
+  /** Desired formation from `ps:scale` — process type -> quantity. */
+  scale: Record<string, number>;
   git: {
     branch: string | null;
     sha: string | null;

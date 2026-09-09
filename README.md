@@ -22,15 +22,16 @@ A terminal dashboard and command center for [Dokku](https://dokku.com/). One sel
 
 ## What it does
 
-- **Everything at a glance** — every app's run state, process scale, per-container CPU/memory, domains, certificate expiry, port mappings, storage mounts and linked databases, in one table you navigate with arrow keys.
+- **Everything at a glance** — every app's run state, process scale, per-container CPU/memory, domains, certificate expiry, port mappings, storage mounts, resource limits, health-check state, proxy type, scheduled tasks and linked databases, in one table you navigate with arrow keys.
 - **Run any Dokku command without leaving** — press `:` and type it (`ps:scale api web=2`, `letsencrypt:auto-renew`, anything). `$app` expands to the selected app, output streams live into the pane, and the dashboard refreshes itself afterward so you immediately see the result.
-- **One-key actions** — `R`/`S`/`B` prefill restart / stop / rebuild for the selected app; you just hit enter to run it.
+- **One-key actions** — `R`/`S`/`B` prefill restart / stop / rebuild for the selected app; you just hit enter to run it. `F` prefills `logs:failed` (why the last deploy died) and `I` prefills `ps:inspect`.
 - **A cheat sheet that's also a launcher** — press `c` for a filterable reference of the most useful Dokku commands, grouped by area. Hit enter on any of them to drop it into the command line, pre-filled with the selected app.
 - **Live tail of logs** — per-app log streaming with scrollback, stderr highlighted.
 - **Datastore services too** — postgres, redis, mysql, mongo and friends: status, version, exposed ports, connection string and which apps they're linked to.
 - **Guardrails built in** — destructive commands (`ps:stop`, `apps:destroy`, `config:unset`, …) ask for a y/N confirmation before running. Commands are spawned directly with no shell, so pipes and `;` tricks do nothing, and anything that would normally prompt for confirmation aborts instead of hanging.
 - **Secrets stay masked** — env var values and database connection strings are hidden until you press `s`.
 - **Feels live, not polled** — auto-refresh plus Dokku's events stream (when enabled) means deploys, restarts and scale changes show up within seconds, and the header tells you exactly how fresh the data is.
+- **Cheap over SSH** — a full sweep is a fixed handful of batched `<plugin>:report --format json` calls rather than four per app, so refresh cost doesn't grow with the number of apps (a 30-app host went from 121 `dokku` invocations per refresh to 8). Run `--doctor` to see whether batching works on your host; if anything disagrees it silently falls back to per-app reports.
 - **Works anywhere** — on the host itself, against a remote host over SSH, or with `--demo` sample data so you can try it without Dokku at all.
 
 ## Get it
@@ -102,13 +103,13 @@ The trade-off: `dokku@host` is Dokku's restricted user, so only dokku commands w
 
 Five views, all sharing the same layout: a table on top (`↑`/`↓` selects a row), detail for the selected row below. Switch with the number keys, `←`/`→`, or `tab`.
 
-1. **Overview** — the works for the selected app: created date, deploy source, git branch/SHA/last-deploy, restart policy, port mappings, storage mounts, linked services, plus its domains and SSL certificate status (issuer and expiry, highlighted when expiring soon).
-2. **Processes** — per-process scale and each container's status, CPU and memory.
+1. **Overview** — the works for the selected app: created date, deploy source, git branch/SHA/last-deploy, restart policy, port mappings, storage mounts, resource limits, linked services, the runtime line (proxy type and ports, health-check state, scheduled tasks, deploy lock), plus its domains and SSL certificate status (issuer and expiry, highlighted when expiring soon).
+2. **Processes** — per-process scale and each container's status, CPU and memory, with the desired formation from `ps:scale` alongside the live count (so a missing container is obvious) and each process type's resource limits.
 3. **Config / Env** — environment variables, values masked until you press `s`.
 4. **Logs** — live tail for the selected app, `j`/`k` for scrollback, stderr highlighted. Buffers are kept per app, so flipping between apps doesn't lose your place.
 5. **Services** — datastore services from the official plugin family (postgres, redis, mysql, mongo, …) with status, version, ports, connection string (`s` to reveal) and linked apps.
 
-The **cheat sheet** (`c`) opens as an overlay from any view — a filterable reference covering apps, deploys, scaling, domains, Let's Encrypt, config, logs, datastores, storage and maintenance. Enter inserts the highlighted command into the `:` prompt.
+The **cheat sheet** (`c`) opens as an overlay from any view — a filterable reference covering apps, deploys, scaling, domains, Let's Encrypt, config, logs, datastores, storage, health checks, resource limits, cron and one-off tasks, builders and registry, and maintenance. Enter inserts the highlighted command into the `:` prompt.
 
 ## Running commands
 
@@ -136,6 +137,7 @@ Press `:` and type any dokku command, with or without the leading `dokku`:
 | `j` / `k`      | Scroll the detail pane (log scrollback, long config lists) |
 | `:`            | Open the command line                         |
 | `R` / `S` / `B`| Prefill restart / stop / rebuild for the selected app |
+| `F` / `I`      | Prefill `logs:failed` / `ps:inspect` for the selected app |
 | `c`            | Command cheat sheet; `enter` inserts into `:` |
 | `/`            | Filter the app list (or the cheat sheet)      |
 | `s`            | Reveal / hide secrets (config values, service DSN) |
@@ -152,7 +154,7 @@ Press `:` and type any dokku command, with or without the leading `dokku`:
 | `DOKKU_INK_SSH`     | –          | Remote target, same as `--ssh` (e.g. `dokku@my-host`) |
 | `DOKKU_INK_HOST`    | hostname   | Label shown in the header                |
 | `DOKKU_INK_DEMO`    | –          | Set to `1` to force demo data            |
-| `DOKKU_INK_REFRESH` | `30`       | Auto-refresh interval in seconds (`0` disables) |
+| `DOKKU_INK_REFRESH` | `30`       | Auto-refresh interval in seconds (`0` disables). Container metrics sample on a separate, slower timer (never faster than 15s) since `docker stats` has to wait out a sampling interval |
 | `DOKKU_INK_NO_UPDATE_CHECK` | – | Disable the on-launch check for a newer release (also honors `NO_UPDATE_NOTIFIER`) |
 
 ## Troubleshooting

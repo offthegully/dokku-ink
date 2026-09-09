@@ -6,6 +6,11 @@ import assert from 'node:assert/strict';
 import {
   buildApps,
   buildAppDetail,
+  buildResources,
+  namesFromAppsRows,
+  parseAppList,
+  parseScale,
+  parseStorageJson,
   parseDatastorePlugins,
   parseDf,
   parseDockerStats,
@@ -75,7 +80,7 @@ test('toBool coerces dokku string booleans', () => {
 });
 
 test('buildApps normalises a running app with multiple processes', () => {
-  const apps = buildApps(['blog', 'staging'], appsRep, psRep, domRep, certRep);
+  const apps = buildApps(['blog', 'staging'], { apps: appsRep, ps: psRep, domains: domRep, certs: certRep });
   const blog = apps.find((a) => a.name === 'blog')!;
   assert.equal(blog.running, true);
   assert.equal(blog.deploySource, 'dockerfile');
@@ -91,7 +96,7 @@ test('buildApps normalises a running app with multiple processes', () => {
 });
 
 test('buildApps handles a stopped app with no SSL', () => {
-  const apps = buildApps(['staging'], appsRep, psRep, domRep, certRep);
+  const apps = buildApps(['staging'], { apps: appsRep, ps: psRep, domains: domRep, certs: certRep });
   const s = apps[0];
   assert.equal(s.running, false);
   assert.equal(s.processes[0].instances[0].status, 'exited (137)');
@@ -102,13 +107,15 @@ test('buildApps parses Dokku 0.38 per-app report shapes', () => {
   // 0.38 quirks: certs use `enabled`/`issuer` (no ssl- prefix), ps exposes
   // `computed-restart-policy`, domains carry `app-vhosts`, and process status
   // keys are dot-separated (`status-web.1`, from CONTAINER.web.1 files).
-  const apps = buildApps(
-    ['x'],
-    { x: { 'created-at': '1781837404', 'deploy-source': '', dir: '/home/dokku/x' } },
-    { x: { deployed: 'true', running: 'true', 'computed-restart-policy': 'on-failure:10', 'status-web.1': 'running (abc)', 'status-web.2': 'running (def)' } },
-    { x: { 'app-enabled': 'true', 'app-vhosts': 'x.example.com', 'global-vhosts': 'example.com' } },
-    { x: { dir: '/home/dokku/x/tls', enabled: 'false', hostnames: '', issuer: '' } },
-  );
+  const apps = buildApps(['x'], {
+    apps: { x: { 'created-at': '1781837404', 'deploy-source': '', dir: '/home/dokku/x', locked: 'true' } },
+    ps: { x: { deployed: 'true', running: 'true', 'computed-restart-policy': 'on-failure:10', 'status-web.1': 'running (abc)', 'status-web.2': 'running (def)' } },
+    domains: { x: { 'app-enabled': 'true', 'app-vhosts': 'x.example.com', 'global-vhosts': 'example.com' } },
+    certs: { x: { dir: '/home/dokku/x/tls', enabled: 'false', hostnames: '', issuer: '' } },
+    checks: { x: { 'disabled-list': 'none', 'skipped-list': 'worker' } },
+    proxy: { x: { 'computed-type': 'nginx', enabled: 'true', 'computed-proxy-port': '80', 'computed-proxy-ssl-port': '443' } },
+    cron: { x: { 'task-count': '3' } },
+  });
   const a = apps[0];
   assert.equal(a.running, true);
   assert.equal(a.restartPolicy, 'on-failure:10');
@@ -117,15 +124,24 @@ test('buildApps parses Dokku 0.38 per-app report shapes', () => {
   assert.deepEqual(a.domains, ['x.example.com']);
   assert.equal(a.domainsEnabled, true);
   assert.equal(a.ssl, null); // enabled:false -> null
+  assert.equal(a.locked, true);
+  assert.deepEqual(a.checks, { disabled: [], skipped: ['worker'] }); // "none" -> []
+  assert.equal(a.proxy?.type, 'nginx');
+  assert.equal(a.proxy?.port, '80');
+  assert.equal(a.cronTasks, 3);
 });
 
 test('buildApps is resilient to missing reports', () => {
-  const apps = buildApps(['ghost'], null, null, null, null);
+  const apps = buildApps(['ghost'], {});
   assert.equal(apps.length, 1);
   assert.equal(apps[0].running, null);
   assert.deepEqual(apps[0].processes, []);
   assert.deepEqual(apps[0].domains, []);
   assert.equal(apps[0].ssl, null);
+  assert.equal(apps[0].locked, false);
+  assert.equal(apps[0].checks, null);
+  assert.equal(apps[0].proxy, null);
+  assert.equal(apps[0].cronTasks, null);
 });
 
 test('badges classify state correctly', () => {
@@ -189,7 +205,7 @@ test('parseDockerStats maps NDJSON samples by container name', () => {
 });
 
 test('appUsage sums container samples for an app', () => {
-  const apps = buildApps(['blog'], appsRep, psRep, domRep, certRep);
+  const apps = buildApps(['blog'], { apps: appsRep, ps: psRep, domains: domRep, certs: certRep });
   const stats = parseDockerStats(
     [
       '{"Name":"blog.web.1","CPUPerc":"0.4%","MemUsage":"100MiB / 2GiB"}',
@@ -301,10 +317,88 @@ test('buildAppDetail assembles drill-in reports (both key shapes)', () => {
 });
 
 test('soonestCert picks the certificate expiring first', () => {
-  const apps = buildApps(['blog', 'staging'], appsRep, psRep, domRep, certRep);
+  const apps = buildApps(['blog', 'staging'], { apps: appsRep, ps: psRep, domains: domRep, certs: certRep });
   // Only blog has an enabled cert (2099) -> it wins; staging's disabled cert is ignored.
   const s = soonestCert(apps);
   assert.equal(s?.app, 'blog');
   assert.ok(s!.days > 0);
   assert.equal(soonestCert([]), null);
+});
+
+
+// ---------------------------------------------------------------------------
+// Batched (no-arg) report handling — the path that replaced 1+4N invocations
+// ---------------------------------------------------------------------------
+
+test('parseAppList reads the JSON array and falls back to text', () => {
+  assert.deepEqual(parseAppList('["blog","api"]'), ['blog', 'api']);
+  assert.deepEqual(parseAppList('=====> My Apps\nblog\napi\n'), ['blog', 'api']);
+  assert.deepEqual(parseAppList(''), []);
+});
+
+test('namesFromAppsRows derives app names from the report dir key', () => {
+  assert.deepEqual(
+    namesFromAppsRows([{ dir: '/home/dokku/blog' }, { dir: '/home/dokku/api/' }]),
+    ['blog', 'api'],
+  );
+  // Any row without a dir makes the whole batch unusable for naming.
+  assert.equal(namesFromAppsRows([{ dir: '/home/dokku/blog' }, { 'created-at': '1' }]), null);
+  assert.equal(namesFromAppsRows([]), null);
+  assert.equal(namesFromAppsRows(null), null);
+});
+
+test('buildResources groups limit/reserve keys by process type', () => {
+  const res = buildResources({
+    'web.limit.memory': '512m',
+    'web.limit.cpu': '1',
+    'web.reserve.memory': '256m',
+    '_default_.limit.memory': '128m',
+    'worker.limit.memory': '', // unset values are dropped
+  });
+  assert.deepEqual(res.map((r) => r.processType), ['web', '_default_']); // _default_ last
+  assert.deepEqual(res[0].limits, { memory: '512m', cpu: '1' });
+  assert.deepEqual(res[0].reserves, { memory: '256m' });
+  assert.deepEqual(buildResources(undefined), []);
+  assert.deepEqual(buildResources({}), []);
+});
+
+test('parseScale reads the ps:scale JSON formation', () => {
+  assert.deepEqual(parseScale('[{"process_type":"web","quantity":2},{"process_type":"worker","quantity":1}]'), {
+    web: 2,
+    worker: 1,
+  });
+  assert.deepEqual(parseScale('[]'), {});
+  assert.deepEqual(parseScale('-----> Scaling for python\nweb: 1'), {}); // stdout form
+  assert.deepEqual(parseScale(''), {});
+});
+
+test('parseStorageJson renders 0.38 named storage entries', () => {
+  assert.deepEqual(
+    parseStorageJson('[{"host_path":"/var/lib/dokku/data/storage/up","container_path":"/app/up"}]'),
+    ['/var/lib/dokku/data/storage/up:/app/up'],
+  );
+  assert.deepEqual(
+    parseStorageJson('[{"entry_name":"uploads","host_path":"/h","container_path":"/c","readonly":true}]'),
+    ['uploads /h:/c:ro'],
+  );
+  assert.deepEqual(parseStorageJson('[]'), []);
+  // Text output (older dokku) is not JSON — the caller keeps its text parse.
+  assert.equal(parseStorageJson('=====> app volume bind-mounts:\n  /h:/c'), null);
+});
+
+test('buildAppDetail carries resources and the desired formation', () => {
+  const d = buildAppDetail(
+    { map: 'http:80:5000' },
+    undefined,
+    undefined,
+    '',
+    { 'web.limit.memory': '512m' },
+    '[{"process_type":"web","quantity":3}]',
+  );
+  assert.deepEqual(d.scale, { web: 3 });
+  assert.equal(d.resources[0].limits.memory, '512m');
+  // Both are optional: older dokku / failed calls leave them empty.
+  const bare = buildAppDetail(undefined, undefined, undefined, '');
+  assert.deepEqual(bare.scale, {});
+  assert.deepEqual(bare.resources, []);
 });

@@ -99,6 +99,7 @@ KEYS (inside the dashboard)
   /              Filter the app list (or the cheat sheet); esc clears
   s              Reveal / hide secrets (Config values, service DSN)
   R / S / B      Prefill restart / stop / rebuild for the selected app
+  F / I          Prefill logs:failed / ps:inspect for the selected app
   :              Open the command line (run any dokku command;
                  $app expands to the selected app, esc cancels/kills)
   r              Refresh data from Dokku
@@ -110,7 +111,9 @@ ENV
   DOKKU_INK_SSH      Remote target, same as --ssh (e.g. dokku@my-host)
   DOKKU_INK_HOST     Label shown in the header (default: hostname)
   DOKKU_INK_DEMO     Set to 1 to force demo data
-  DOKKU_INK_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off)
+  DOKKU_INK_REFRESH  Auto-refresh interval in seconds (default: 30, 0 = off).
+                     Container metrics (docker stats) sample on their own
+                     slower timer, never faster than every 15s.
   DOKKU_INK_NO_UPDATE_CHECK  Set to disable the on-launch new-release check
 
 Run this on your Dokku host (or point --ssh at one); it shells out to

@@ -79,7 +79,28 @@ test('apps view auto-loads the selected app summary pane', () =>
     // — real terminals render correctly; see also the release.1 note below).
     const all = frames.join('\n');
     assert.match(all, /blog\.example\.com {2}✓ cert/);
-    assert.match(all, /SSL {6}LE ✓ · Let's Encrypt · expires 2026-07-30/);
+    // Demo dates are relative to now (see demo.ts), so match the shape, not
+    // a fixed day — pinning one made this test rot as the calendar moved.
+    assert.match(all, /SSL {6}LE ✓ · Let's Encrypt · expires \d{4}-\d{2}-\d{2}/);
+    // Runtime facts pulled from the proxy/checks/cron reports.
+    assert.match(all, /RUNTIME {2}nginx/);
+    assert.match(all, /checks on/);
+    assert.match(all, /LIMITS/); // blog has a resource limit in the demo data
+  }));
+
+test('processes view shows scale, limits and check state', () =>
+  withApp(async ({ lastFrame, frames, stdin }) => {
+    stdin.write('2'); // Processes
+    await tick(300); // debounce + loadAppDetail() for scale/resources
+    const all = frames.join('\n') + (lastFrame() ?? '');
+    // The process-type rows carry the scale and the resource limits. They used
+    // to be dropped on a short terminal: the pane rendered more rows than the
+    // viewport and Yoga squeezed arbitrary ones out (it is windowed now).
+    assert.match(all, /web scale 2/);
+    assert.match(all, /worker scale 1/);
+    assert.match(all, /limit 1cpu\/512m/);
+    assert.match(all, /checks on/); // checks:report state on the header line
+    assert.match(all, /proxy nginx/);
   }));
 
 test('tab cycles to the next view', () =>

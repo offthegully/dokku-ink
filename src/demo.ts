@@ -2,6 +2,12 @@
 
 import type { AppDetail, DokkuApp, DokkuService, HostDisk, StatsMap } from './types.js';
 
+// Demo dates are relative to now, not hardcoded: with fixed timestamps the
+// preview drifted into showing every certificate as long expired and every app
+// as years old, which is the opposite of what `--demo` is meant to show off.
+const daysAgo = (n: number): string => new Date(Date.now() - n * 86_400_000).toISOString();
+const daysAhead = (n: number): string => new Date(Date.now() + n * 86_400_000).toISOString();
+
 interface DemoData {
   apps: DokkuApp[];
   config: Record<string, Record<string, string>>;
@@ -18,7 +24,7 @@ export const DEMO: DemoData = {
       running: true,
       deployed: true,
       deploySource: 'dockerfile',
-      createdAt: '2025-11-02T14:21:00Z',
+      createdAt: daysAgo(310),
       restartPolicy: 'on-failure:10',
       processes: [
         {
@@ -41,17 +47,21 @@ export const DEMO: DemoData = {
         enabled: true,
         hostnames: ['blog.example.com', 'www.blog.example.com'],
         issuer: "Let's Encrypt",
-        startsAt: '2026-05-01T00:00:00Z',
-        expiresAt: '2026-07-30T00:00:00Z',
+        startsAt: daysAgo(28),
+        expiresAt: daysAhead(62),
         verified: true,
       },
+      locked: false,
+      checks: { disabled: [], skipped: [] },
+      proxy: { type: 'nginx', enabled: true, port: '80', sslPort: '443' },
+      cronTasks: 2,
     },
     {
       name: 'api',
       running: true,
       deployed: true,
       deploySource: 'herokuish',
-      createdAt: '2025-08-19T09:05:00Z',
+      createdAt: daysAgo(395),
       restartPolicy: 'on-failure:10',
       processes: [
         {
@@ -75,17 +85,21 @@ export const DEMO: DemoData = {
         enabled: true,
         hostnames: ['api.example.com'],
         issuer: "Let's Encrypt",
-        startsAt: '2026-06-10T00:00:00Z',
-        expiresAt: '2026-09-08T00:00:00Z',
+        startsAt: daysAgo(41),
+        expiresAt: daysAhead(49),
         verified: true,
       },
+      locked: false,
+      checks: { disabled: [], skipped: ['worker'] },
+      proxy: { type: 'nginx', enabled: true, port: '80', sslPort: '443' },
+      cronTasks: 0,
     },
     {
       name: 'staging',
       running: false,
       deployed: true,
       deploySource: 'git',
-      createdAt: '2026-03-30T18:44:00Z',
+      createdAt: daysAgo(160),
       restartPolicy: 'on-failure:10',
       processes: [
         {
@@ -97,13 +111,17 @@ export const DEMO: DemoData = {
       domains: ['staging.example.com'],
       domainsEnabled: true,
       ssl: null,
+      locked: true,
+      checks: { disabled: ['_all_'], skipped: [] },
+      proxy: { type: 'nginx', enabled: true, port: '80', sslPort: '443' },
+      cronTasks: 0,
     },
     {
       name: 'metrics',
       running: true,
       deployed: true,
       deploySource: 'metabase/metabase:latest',
-      createdAt: '2026-01-12T11:30:00Z',
+      createdAt: daysAgo(240),
       restartPolicy: 'always',
       processes: [
         {
@@ -118,17 +136,21 @@ export const DEMO: DemoData = {
         enabled: true,
         hostnames: ['metrics.example.com'],
         issuer: "Let's Encrypt",
-        startsAt: '2026-04-15T00:00:00Z',
-        expiresAt: '2026-07-05T00:00:00Z', // expiring soon
+        startsAt: daysAgo(81),
+        expiresAt: daysAhead(9), // expiring soon — demos the header warning
         verified: true,
       },
+      locked: false,
+      checks: { disabled: [], skipped: [] },
+      proxy: { type: 'traefik', enabled: true, port: '80', sslPort: '443' },
+      cronTasks: 1,
     },
     {
       name: 'landing',
       running: true,
       deployed: true,
       deploySource: 'dockerfile',
-      createdAt: '2025-06-01T08:00:00Z',
+      createdAt: daysAgo(480),
       restartPolicy: 'on-failure:10',
       processes: [
         {
@@ -140,6 +162,10 @@ export const DEMO: DemoData = {
       domains: [],
       domainsEnabled: false,
       ssl: null,
+      locked: false,
+      checks: { disabled: [], skipped: [] },
+      proxy: { type: 'nginx', enabled: false, port: '80', sslPort: '443' },
+      cronTasks: 0,
     },
   ],
 
@@ -228,33 +254,46 @@ export const DEMO: DemoData = {
 
   details: {
     blog: {
+      scale: { web: 2, worker: 1 },
+      resources: [{ processType: 'web', limits: { memory: '512m', cpu: '1' }, reserves: { memory: '256m' } }],
       ports: ['http:80:5000', 'https:443:5000'],
       storage: ['/var/lib/dokku/data/storage/blog-uploads:/app/public/uploads'],
-      git: { branch: 'main', sha: '4f2a91c', lastUpdated: '2026-06-28T21:14:00Z', sourceImage: null },
+      git: { branch: 'main', sha: '4f2a91c', lastUpdated: daysAgo(3), sourceImage: null },
       network: { initial: 'bridge', attachPostCreate: null, attachPostDeploy: null },
     },
     api: {
+      scale: { web: 3, worker: 2 },
+      resources: [
+        { processType: 'web', limits: { memory: '1024m' }, reserves: { memory: '512m', cpu: '0.5' } },
+        { processType: 'worker', limits: { memory: '512m' }, reserves: {} },
+      ],
       ports: ['http:80:5000', 'https:443:5000'],
       storage: [],
-      git: { branch: 'main', sha: 'b81d3e0', lastUpdated: '2026-07-01T09:02:00Z', sourceImage: null },
+      git: { branch: 'main', sha: 'b81d3e0', lastUpdated: daysAgo(1), sourceImage: null },
       network: { initial: 'bridge', attachPostCreate: 'internal-net', attachPostDeploy: null },
     },
     staging: {
+      scale: { web: 1 },
+      resources: [],
       ports: ['http:80:5000'],
       storage: [],
-      git: { branch: 'develop', sha: '9cc2f17', lastUpdated: '2026-05-19T16:40:00Z', sourceImage: null },
+      git: { branch: 'develop', sha: '9cc2f17', lastUpdated: daysAgo(44), sourceImage: null },
       network: { initial: 'bridge', attachPostCreate: null, attachPostDeploy: null },
     },
     metrics: {
+      scale: { web: 1 },
+      resources: [{ processType: '_default_', limits: { memory: '2048m' }, reserves: {} }],
       ports: ['http:80:3000', 'https:443:3000'],
       storage: ['/var/lib/dokku/data/storage/metabase:/metabase-data'],
       git: { branch: null, sha: null, lastUpdated: null, sourceImage: 'metabase/metabase:latest' },
       network: { initial: 'bridge', attachPostCreate: null, attachPostDeploy: null },
     },
     landing: {
+      scale: { web: 1 },
+      resources: [],
       ports: ['http:80:8080'],
       storage: [],
-      git: { branch: 'main', sha: '0de91aa', lastUpdated: '2026-04-02T11:00:00Z', sourceImage: null },
+      git: { branch: 'main', sha: '0de91aa', lastUpdated: daysAgo(91), sourceImage: null },
       network: { initial: 'bridge', attachPostCreate: null, attachPostDeploy: null },
     },
   },
