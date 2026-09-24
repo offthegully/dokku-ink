@@ -49,13 +49,12 @@ curl -fsSL https://raw.githubusercontent.com/offthegully/dokku-ink/main/install.
 
 **Download it yourself:** grab `dokku-ink-<os>-<arch>` from the [releases page](https://github.com/offthegully/dokku-ink/releases), `chmod +x` it, and put it on your `PATH`.
 
-**From source** (needs Node 18+):
+**From source** (needs [Bun](https://bun.sh)):
 
 ```bash
 git clone https://github.com/offthegully/dokku-ink.git
 cd dokku-ink
-npm install && npm run build
-npm link             # global `dokku-ink`, or: node dist/index.js
+bun install && bun run build:binary   # builds ./build/dokku-ink
 ```
 
 </details>
@@ -131,12 +130,12 @@ It shows what each `dokku` command returned and whether it could be parsed, whet
 Releases are built by GitHub Actions (`.github/workflows/release.yml`) whenever a tag starting with `v` is pushed.
 
 ```bash
-npm test && npm run typecheck
-npm version patch        # or minor / major
+bun test && bun run typecheck
+bun pm version patch     # or minor / major
 git push --follow-tags
 ```
 
-`npm version` needs a clean working tree. It updates `package.json`, commits it (e.g. `0.1.7`), and creates the matching `v0.1.7` tag. A plain `git push` doesn't send tags, so without `--follow-tags` nothing gets built. The workflow then:
+`bun pm version` needs a clean working tree. It updates `package.json`, commits it (e.g. `v0.1.7`), and creates the matching `v0.1.7` tag. A plain `git push` doesn't send tags, so without `--follow-tags` nothing gets built. The workflow then:
 
 1. Cross-compiles the four binaries (`linux`/`darwin` × `x64`/`arm64`) with Bun.
 2. Creates a GitHub Release named after the tag, with auto-generated notes, and attaches the binaries.
@@ -145,7 +144,7 @@ After that, the install script's default of "latest" picks it up, and running co
 
 Good to know:
 
-- **Keep the tag and `package.json` in sync.** The binary's `--version` comes from `package.json`, not the tag. Using `npm version` rather than `git tag` keeps them the same.
+- **Keep the tag and `package.json` in sync.** The binary's `--version` comes from `package.json`, not the tag. Using `bun pm version` rather than `git tag` keeps them the same.
 - **Test the build locally first** with `bun run build:binaries`. The output lands in `./build`.
 - **If the workflow fails,** fix it on `main` and move the tag: `git tag -f v0.1.7 && git push -f origin v0.1.7`. If the release was already created, remove it first with `gh release delete v0.1.7 --cleanup-tag`, then create and push the tag again.
 

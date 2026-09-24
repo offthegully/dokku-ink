@@ -5,14 +5,11 @@
     "moduleResolution": "NodeNext",
     "jsx": "react-jsx",
     "lib": ["ES2022"],
-    "outDir": "dist",
-    "rootDir": "src",
+    "noEmit": true,
     "strict": true,
     "noUncheckedIndexedAccess": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "declaration": false,
-    "sourceMap": false,
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src"]

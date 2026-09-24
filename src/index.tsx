@@ -7,8 +7,8 @@ import App from './App.js';
 
 // The version is baked in at compile time for the standalone binary (see
 // scripts/build.ts, which replaces __DOKKU_INK_VERSION__ via --define). When
-// running from src/ (tsx/bun) or dist/ (node) that token is undefined, so we
-// fall back to reading package.json one level above the entry point.
+// running from src/ (`bun run dev`) that token is undefined, so we fall back
+// to reading package.json one level above the entry point.
 declare const __DOKKU_INK_VERSION__: string | undefined;
 const version =
   typeof __DOKKU_INK_VERSION__ !== 'undefined'

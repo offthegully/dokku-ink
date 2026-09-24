@@ -3,9 +3,6 @@
   "version": "0.1.6",
   "description": "A terminal dashboard & command center for Dokku. See all your apps and run any dokku command, on the host or over SSH.",
   "type": "module",
-  "bin": {
-    "dokku-ink": "dist/index.js"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/offthegully/dokku-ink.git"
@@ -14,26 +11,13 @@
   "bugs": {
     "url": "https://github.com/offthegully/dokku-ink/issues"
   },
-  "files": [
-    "dist",
-    "README.md"
-  ],
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js",
-    "prepublishOnly": "npm run build",
     "build:binary": "bun scripts/build.ts",
     "build:binaries": "bun scripts/build-all.ts",
-    "dev": "tsx src/index.tsx",
-    "demo": "tsx src/index.tsx --demo",
-    "dev:bun": "bun src/index.tsx",
-    "demo:bun": "bun src/index.tsx --demo",
-    "start": "node dist/index.js",
-    "start:bun": "bun dist/index.js",
+    "dev": "bun src/index.tsx",
+    "demo": "bun src/index.tsx --demo",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
-  },
-  "engines": {
-    "node": ">=18"
+    "test": "bun test ./test"
   },
   "keywords": [
     "dokku",
@@ -53,7 +37,6 @@
     "@types/node": "^22.20.4",
     "@types/react": "^18.3.31",
     "ink-testing-library": "^4.0.0",
-    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }
