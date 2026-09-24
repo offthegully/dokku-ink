@@ -223,16 +223,21 @@ export function namesFromAppsRows(
 const sameNames = (a: string[], b: string[]): boolean =>
   a.length === b.length && [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
 
-// Per-app fallback for one plugin: the old N-invocations-per-report path, used
-// only when the batched call failed or its rows could not be aligned.
+// Per-app fallback: the old N-invocations-per-report path, used only for the
+// plugins whose batched call failed or whose rows could not be aligned. Every
+// (plugin, app) pair shares one concurrency limit — running a separate limit
+// per plugin fanned out to 7 × 8 = 56 dokku processes at once, far past the
+// 10 sessions an OpenSSH ControlMaster connection allows by default.
 async function reportPerApp(
-  plugin: string,
+  plugins: readonly string[],
   names: string[],
-): Promise<Record<string, Record<string, string>>> {
-  const out: Record<string, Record<string, string>> = {};
-  await mapLimit(names, 8, async (name) => {
+): Promise<Record<string, Record<string, Record<string, string>>>> {
+  const out: Record<string, Record<string, Record<string, string>>> =
+    Object.fromEntries(plugins.map((p) => [p, {}]));
+  const jobs = plugins.flatMap((plugin) => names.map((name) => ({ plugin, name })));
+  await mapLimit(jobs, 8, async ({ plugin, name }) => {
     const rep = await reportForApp(plugin, name);
-    if (rep) out[name] = rep;
+    if (rep) out[plugin][name] = rep;
   });
   return out;
 }
@@ -365,9 +370,7 @@ export async function loadOverview(): Promise<Overview> {
   // flat in the number of apps (a 12-app host used to need 49 invocations
   // here, a 30-app host 121).
   const [listed, ...batched] = await Promise.all([
-    // --format json is the clean shape; the text parser stays as a fallback
-    // for dokku builds that reject the flag on apps:list.
-    dokkuRaw(["apps:list", "--format", "json"]),
+    listAppNames(),
     ...SWEEP_PLUGINS.map((plugin) => reportAllApps(plugin)),
   ]);
   const rows = Object.fromEntries(
@@ -375,13 +378,8 @@ export async function loadOverview(): Promise<Overview> {
   ) as Record<SweepPlugin, Array<Record<string, string>> | null>;
 
   let names: string[] = [];
-  if (listed.ok) {
-    names = parseAppList(listed.stdout);
-  } else {
-    const retry = await dokkuRaw(["apps:list"]);
-    if (retry.ok) names = parseAppNames(retry.stdout);
-    else warnings.push(`apps:list failed: ${retry.error ?? retry.stderr}`);
-  }
+  if ("names" in listed) names = listed.names;
+  else warnings.push(`apps:list failed: ${listed.error}`);
 
   // Cross-check the batched alignment against the names apps:report carries
   // in its own `dir` key. If those disagree with apps:list, the positional
@@ -401,14 +399,31 @@ export async function loadOverview(): Promise<Overview> {
   if (reported && trustOrder) names = reported;
 
   const reports = {} as SweepReports;
-  await Promise.all(
-    SWEEP_PLUGINS.map(async (plugin) => {
-      const aligned = trustOrder ? alignRows(names, rows[plugin]) : null;
-      reports[plugin] = aligned ?? (await reportPerApp(plugin, names));
-    }),
-  );
+  const unaligned: SweepPlugin[] = [];
+  for (const plugin of SWEEP_PLUGINS) {
+    const aligned = trustOrder ? alignRows(names, rows[plugin]) : null;
+    if (aligned) reports[plugin] = aligned;
+    else unaligned.push(plugin);
+  }
+  if (unaligned.length > 0) Object.assign(reports, await reportPerApp(unaligned, names));
 
-  return { apps: buildApps(names, reports), source: "dokku", warnings };
+  return {
+    apps: buildApps(names, reports),
+    source: "dokku",
+    warnings,
+    batchOrder: trustOrder,
+  };
+}
+
+// apps:list as names. --format json is the clean shape; the plain form is the
+// fallback for dokku builds that reject the flag. The retry runs as soon as
+// the JSON call fails rather than after the batched reports it races with.
+async function listAppNames(): Promise<{ names: string[] } | { error: string }> {
+  const json = await dokkuRaw(["apps:list", "--format", "json"]);
+  if (json.ok) return { names: parseAppList(json.stdout) };
+  const text = await dokkuRaw(["apps:list"]);
+  if (text.ok) return { names: parseAppNames(text.stdout) };
+  return { error: text.error ?? text.stderr };
 }
 
 // `dokku apps:list --format json` -> ["blog", "staging"]. Falls back to the
@@ -507,14 +522,25 @@ function parseCount(raw: string | undefined): number | null {
 export async function loadOverviewLight(prev: Overview): Promise<Overview> {
   if (prev.source !== "dokku" || !(await hasDokku())) return loadOverview();
   const names = prev.apps.map((a) => a.name);
-  const rows = await reportAllApps("ps");
-  // Two different failures, two different answers: a row count that disagrees
-  // with the previous snapshot means an app was created or destroyed, so the
-  // whole snapshot is stale and needs the full sweep. A batched report this
-  // host simply can't serve just means falling back to one call per app —
-  // escalating to a full refresh every poll would be far more expensive.
+  // ps:report rows carry no app name, so they can only be matched by
+  // position. A matching row count isn't enough to trust that: renaming an
+  // app, or destroying one and creating another between polls, keeps the
+  // count and would graft one app's state onto another. apps:list runs in
+  // the same round-trip to catch exactly that.
+  const [listed, rows] = await Promise.all([listAppNames(), reportAllApps("ps")]);
+  // Two different failures, two different answers: an app list or row count
+  // that disagrees with the previous snapshot means apps were created,
+  // destroyed or renamed, so the whole snapshot is stale and needs the full
+  // sweep. A batched report this host simply can't serve just means falling
+  // back to one call per app — escalating to a full refresh every poll would
+  // be far more expensive.
+  if ("names" in listed && !sameNames(listed.names, names)) return loadOverview();
   if (rows && rows.length !== names.length) return loadOverview();
-  const psRep = alignRows(names, rows) ?? (await reportPerApp("ps", names));
+  // Positional matching is only safe when the last full sweep confirmed the
+  // batched order and apps:list just confirmed nothing has changed since.
+  const canAlign = prev.batchOrder === true && "names" in listed;
+  const psRep =
+    (canAlign ? alignRows(names, rows) : null) ?? (await reportPerApp(["ps"], names)).ps;
   const apps = prev.apps.map((a) => {
     const ps = psRep[a.name];
     if (!ps) return a;
@@ -528,7 +554,7 @@ export async function loadOverviewLight(prev: Overview): Promise<Overview> {
       processes: parseProcesses(ps),
     };
   });
-  return { apps, source: "dokku", warnings: prev.warnings };
+  return { apps, source: "dokku", warnings: prev.warnings, batchOrder: prev.batchOrder };
 }
 
 // ---------------------------------------------------------------------------

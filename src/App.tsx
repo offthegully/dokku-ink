@@ -1315,6 +1315,9 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   const [configLoading, setConfigLoading] = useState(false);
   const [services, setServices] = useState<{ list: DokkuService[]; v: number; at: number } | null>(null);
   const [servicesLoading, setServicesLoading] = useState(false);
+  // Set by `r` and `:` commands: the next dataV bump refetches services even
+  // inside the TTL, since those are exactly when a service may have changed.
+  const servicesStale = useRef(false);
   const [detailCache, setDetailCache] = useState<Record<string, { detail: AppDetail; v: number }>>({});
   const [detailLoading, setDetailLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
@@ -1508,6 +1511,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       clearInterval(flush);
       flushNow();
       setCmdRun((r) => (r ? { ...r, running: false } : r));
+      servicesStale.current = true;
       void refresh('full'); // the command may have changed state — show it
       sampleStats.current();
     });
@@ -1650,11 +1654,16 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     // A dataV bump alone isn't worth the sweep this costs (plugin:list, one
     // <plugin>:list per plugin, one <plugin>:info per service) — services only
     // change when someone creates or links one, so hold them for a TTL.
-    if (services && (services.v === dataV || Date.now() - services.at < SERVICES_TTL_MS)) return;
+    if (
+      services &&
+      !servicesStale.current &&
+      (services.v === dataV || Date.now() - services.at < SERVICES_TTL_MS)
+    ) return;
     let cancelled = false;
     if (!services) setServicesLoading(true);
     void loadServices().then((res) => {
       if (cancelled) return;
+      servicesStale.current = false;
       setServices({ list: res.services, v: dataV, at: Date.now() });
       setServicesLoading(false);
     });
@@ -1705,8 +1714,8 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   const detailViewport = Math.max(3, usable - tableRows);
   const overlayViewport = Math.max(3, inner - 2 - 1); // help/command/cheats take one box, minus a title row
 
-  const clampScroll = useCallback((delta: number, total: number) => {
-    setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - detailViewport)));
+  const clampScroll = useCallback((delta: number, total: number, shown = detailViewport) => {
+    setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - shown)));
   }, [detailViewport]);
 
   // Prefill a quick action into the `:` prompt (never auto-runs).
@@ -1895,6 +1904,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       return;
     }
     if (input === 'r') {
+      servicesStale.current = true;
       void refresh('full');
       sampleStats.current();
       return;
@@ -1939,7 +1949,12 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
           const total = currentApp ? Object.keys(configCache[currentApp.name]?.vars || {}).length : 0;
           clampScroll(scrollDown ? 1 : -1, total);
         } else if (currentView.key === 'process' && currentApp) {
-          clampScroll(scrollDown ? 1 : -1, processRows(currentApp, statsMap, currentDetail).length);
+          // ProcessView gives a row to the scroll hint once it overflows, so
+          // clamp against the rows it actually shows or the last one is
+          // unreachable.
+          const total = processRows(currentApp, statsMap, currentDetail).length;
+          const shown = total > detailViewport ? Math.max(1, detailViewport - 1) : detailViewport;
+          clampScroll(scrollDown ? 1 : -1, total, shown);
         }
       }
       return;

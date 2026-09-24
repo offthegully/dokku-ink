@@ -131,6 +131,8 @@ export interface Overview {
   apps: DokkuApp[];
   source: Source;
   warnings: string[];
+  /** The last full sweep confirmed batched report rows follow the app order. */
+  batchOrder?: boolean;
 }
 
 /** Raw `dokku <plugin>:report --format json` output: app -> { key: value }. */
