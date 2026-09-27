@@ -2,6 +2,7 @@
 // Entry point: parse a couple of flags, then render the Ink app.
 
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { render } from 'ink';
 import App from './App.js';
 
@@ -10,10 +11,10 @@ import App from './App.js';
 // running from src/ (`bun run dev`) that token is undefined, so we fall back
 // to reading package.json one level above the entry point.
 declare const __DOKKU_INK_VERSION__: string | undefined;
-const version =
-  typeof __DOKKU_INK_VERSION__ !== 'undefined'
-    ? __DOKKU_INK_VERSION__
-    : (createRequire(import.meta.url)('../package.json') as { version: string }).version;
+const compiled = typeof __DOKKU_INK_VERSION__ !== 'undefined';
+const version = compiled
+  ? __DOKKU_INK_VERSION__!
+  : (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 
 const args = process.argv.slice(2);
 
@@ -35,6 +36,11 @@ if (sshIdx !== -1) {
     process.exit(1);
   }
   process.env.DOKKU_INK_SSH = dest;
+}
+if (args[0] === 'update' || args.includes('--update')) {
+  const { selfUpdate } = await import('./update.js');
+  const result = await selfUpdate(version, { compiled });
+  process.exit(result.ok ? 0 : 1);
 }
 if (args.includes('--doctor') || args.includes('doctor')) {
   const { runDoctor } = await import('./dokku.js');
@@ -73,14 +79,31 @@ const syncStdout = process.stdout.isTTY
     }) as unknown as NodeJS.WriteStream)
   : process.stdout;
 
-const { waitUntilExit } = render(<App version={version} />, { stdout: syncStdout, exitOnCtrlC: false });
+// Pressing `U` in the dashboard sets this and quits; the update itself runs
+// after Ink has released the terminal so its progress prints normally.
+let updateRequested = false;
+const { waitUntilExit } = render(
+  <App version={version} onUpdate={() => (updateRequested = true)} />,
+  { stdout: syncStdout, exitOnCtrlC: false },
+);
 await waitUntilExit();
+
+if (updateRequested) {
+  const { selfUpdate } = await import('./update.js');
+  const result = await selfUpdate(version, { compiled });
+  if (!result.ok || !result.updated) process.exit(result.ok ? 0 : 1);
+  // Relaunch the freshly installed binary with the same flags, handing it the
+  // terminal; its exit code becomes ours.
+  const relaunch = spawnSync(result.binary, args, { stdio: 'inherit' });
+  process.exit(relaunch.status ?? 1);
+}
 
 function printHelp(): void {
   console.log(`dokku-ink — a terminal dashboard & cheat sheet for Dokku
 
 USAGE
   dokku-ink [options]
+  dokku-ink update     Download and install the latest release in place
 
 OPTIONS
   --demo         Show demo data (no Dokku required)
@@ -98,11 +121,12 @@ KEYS (inside the dashboard)
   enter          Insert a cheat-sheet command into the : prompt
   /              Filter the app list (or the cheat sheet); esc clears
   s              Reveal / hide secrets (Config values, service DSN)
-  R / S / B      Prefill restart / stop / rebuild for the selected app
-  F / I          Prefill logs:failed / ps:inspect for the selected app
+  enter          Action menu for the selected app or service
+                 (restart, stop/start, rebuild, scale, failed logs, …)
   :              Open the command line (run any dokku command;
                  $app expands to the selected app, esc cancels/kills)
   r              Refresh data from Dokku
+  U              Update to the new release (when ↑ shows in the header)
   ?              Help overlay
   q / Ctrl-C     Quit
 

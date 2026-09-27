@@ -30,6 +30,11 @@ jobs:
       - name: Build binaries
         run: bun run build:binaries
 
+      - name: Checksum binaries
+        # install.sh and `dokku-ink update` verify downloads against this file.
+        working-directory: build
+        run: sha256sum dokku-ink-* > SHA256SUMS
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,4 +45,5 @@ jobs:
             build/dokku-ink-linux-x64 \
             build/dokku-ink-linux-arm64 \
             build/dokku-ink-darwin-x64 \
-            build/dokku-ink-darwin-arm64
+            build/dokku-ink-darwin-arm64 \
+            build/SHA256SUMS

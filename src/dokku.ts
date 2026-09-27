@@ -359,20 +359,25 @@ function normalizeCerts(
 // Public API
 // ---------------------------------------------------------------------------
 
+// One batched call per plugin, plus apps:list — all in parallel, and all
+// flat in the number of apps (a 12-app host used to need 49 invocations here,
+// a 30-app host 121). None of these reject: failures come back as null/error.
+const startSweep = () =>
+  Promise.all([listAppNames(), ...SWEEP_PLUGINS.map((plugin) => reportAllApps(plugin))] as const);
+
 export async function loadOverview(): Promise<Overview> {
+  // Locally, the sweep can start alongside the `dokku version` probe instead
+  // of waiting a whole dokku startup for it; if dokku turns out to be missing
+  // those calls just fail fast. Over SSH the probe has to go first — it's what
+  // sets up the ControlMaster, and firing 8 connections before it exists
+  // would pay 8 handshakes.
+  const early = isRemote() || process.env.DOKKU_INK_DEMO === "1" ? null : startSweep();
   if (!(await hasDokku())) {
     return { apps: structuredClone(DEMO.apps), source: "demo", warnings: [] };
   }
 
   const warnings: string[] = [];
-
-  // One batched call per plugin, plus apps:list — all in parallel, and all
-  // flat in the number of apps (a 12-app host used to need 49 invocations
-  // here, a 30-app host 121).
-  const [listed, ...batched] = await Promise.all([
-    listAppNames(),
-    ...SWEEP_PLUGINS.map((plugin) => reportAllApps(plugin)),
-  ]);
+  const [listed, ...batched] = await (early ?? startSweep());
   const rows = Object.fromEntries(
     SWEEP_PLUGINS.map((plugin, i) => [plugin, batched[i]]),
   ) as Record<SweepPlugin, Array<Record<string, string>> | null>;
@@ -653,6 +658,9 @@ export function parseDf(out: string): HostDisk | null {
 // Snapshot per-container CPU/memory plus root-disk usage. Returns stats:null
 // when docker isn't reachable (dashboard renders "—" instead of numbers).
 export async function loadStats(): Promise<StatsResult> {
+  // Same reasoning as loadOverview: overlap the two probes locally, but keep
+  // them serial over SSH so the second one rides the first one's connection.
+  const dockerEarly = isRemote() || process.env.DOKKU_INK_DEMO === "1" ? null : hasDocker();
   if (!(await hasDokku())) {
     return {
       stats: structuredClone(DEMO.stats),
@@ -660,7 +668,7 @@ export async function loadStats(): Promise<StatsResult> {
       source: "demo",
     };
   }
-  if (!(await hasDocker())) return { stats: null, disk: null, source: "dokku" };
+  if (!(await (dockerEarly ?? hasDocker()))) return { stats: null, disk: null, source: "dokku" };
   const [statsRes, dfRes] = await Promise.all([
     // --no-stream still waits out one sampling interval (~2s); give it room.
     hostRaw(
@@ -681,7 +689,7 @@ export async function loadStats(): Promise<StatsResult> {
 // ---------------------------------------------------------------------------
 
 // The official dokku datastore plugins all share the list/info CLI shape.
-const DATASTORE_PLUGINS = [
+export const DATASTORE_PLUGINS = [
   "postgres",
   "mysql",
   "mariadb",
@@ -758,13 +766,15 @@ export async function loadServices(): Promise<ServicesResult> {
   }
   const plugins = await datastorePlugins();
   const services: DokkuService[] = [];
+  // The per-plugin lists are independent, so fetch them together rather than
+  // paying one round-trip per installed plugin back to back.
+  const lists = await Promise.all(plugins.map((plugin) => dokkuRaw([`${plugin}:list`])));
   const targets: Array<{ plugin: string; name: string }> = [];
-  for (const plugin of plugins) {
-    const r = await dokkuRaw([`${plugin}:list`]);
-    if (!r.ok) continue; // "There are no <X> services" exits non-zero
-    for (const name of parseServiceList(r.stdout))
-      targets.push({ plugin, name });
-  }
+  plugins.forEach((plugin, i) => {
+    const r = lists[i];
+    if (!r.ok) return; // "There are no <X> services" exits non-zero
+    for (const name of parseServiceList(r.stdout)) targets.push({ plugin, name });
+  });
   await mapLimit(targets, 4, async ({ plugin, name }) => {
     const r = await dokkuRaw([`${plugin}:info`, name]);
     const kv = r.ok ? parseServiceInfo(r.stdout) : {};
