@@ -34,10 +34,11 @@ asset="${BIN_NAME}-${os}-${arch}"
 
 # --- resolve download URL --------------------------------------------------
 if [ -n "${DOKKU_INK_VERSION:-}" ]; then
-  url="https://github.com/${REPO}/releases/download/${DOKKU_INK_VERSION}/${asset}"
+  base="https://github.com/${REPO}/releases/download/${DOKKU_INK_VERSION}"
 else
-  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  base="https://github.com/${REPO}/releases/latest/download"
 fi
+url="${base}/${asset}"
 
 # --- pick a downloader -----------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -50,11 +51,35 @@ fi
 
 # --- download --------------------------------------------------------------
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+sums="$(mktemp)"
+trap 'rm -f "$tmp" "$sums"' EXIT
 
 info "downloading ${asset} (${DOKKU_INK_VERSION:-latest})"
 download "$url" "$tmp" || err "download failed: $url
 (has a release with prebuilt binaries been published yet?)"
+
+# --- verify checksum -------------------------------------------------------
+# Releases before checksums were added have no SHA256SUMS; install those on
+# HTTPS alone. Once the file exists, the binary must be listed and match.
+if download "${base}/SHA256SUMS" "$sums" 2>/dev/null; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  else
+    actual=""
+  fi
+  if [ -n "$actual" ]; then
+    expected="$(awk -v a="$asset" '$2 == a || $2 == "*"a { print $1 }' "$sums")"
+    [ -n "$expected" ] || err "SHA256SUMS doesn't list ${asset}"
+    [ "$expected" = "$actual" ] || err "checksum mismatch for ${asset}
+  expected ${expected}
+  got      ${actual}"
+    info "checksum verified"
+  else
+    info "no sha256sum/shasum found; skipping checksum"
+  fi
+fi
 
 # --- install into the first directory that accepts it ----------------------
 # Tries, in order: the requested dir directly; the same dir via sudo (only for
@@ -104,4 +129,4 @@ case ":$PATH:" in
     ;;
 esac
 
-info "done — run '${BIN_NAME} --help' to get started"
+info "done — run '${BIN_NAME} --help' to get started (and '${BIN_NAME} update' to upgrade later)"

@@ -17,15 +17,15 @@ A terminal dashboard for [Dokku](https://dokku.com/). It's a single self-contain
 │  DOMAINS  routing enabled              SSL                                  │
 │   • blog.example.com  ✓ cert            LE ✔ · expires in 27d               │
 ╰─────────────────────────────────────────────────────────────────────────────╯
- 1-5 view  ←→ switch view  ↑↓ app  / filter  R/S/B actions  : command  q quit
+ ↑↓ app  ←→ view  ↵ actions  / filter  : command  ? help  q quit
 ```
 
 ## What it does
 
 - **See everything at once.** Each app's run state, process scale, CPU/memory, domains, certificate expiry, health checks, linked databases and more, in one table you move through with the arrow keys.
-- **Run any Dokku command in place.** Press `:` and type it. `$app` expands to the selected app, output streams live, and the dashboard refreshes afterward. `R`/`S`/`B` prefill restart/stop/rebuild, and `c` opens a searchable cheat sheet of common commands.
+- **Run any Dokku command in place.** Press `:` and type it. `$app` expands to the selected app, output streams live, and the dashboard refreshes afterward. Press `enter` on an app or service for a menu of common actions (restart, stop/start, rebuild, scale, failed logs, Let's Encrypt, lock…), and `c` opens a searchable cheat sheet of common commands.
 - **Safe by default.** Destructive commands ask for confirmation. Secrets stay masked until you press `s`. Commands run without a shell, so pipes and `;` do nothing.
-- **Stays current.** It refreshes on a timer and, if you've run `dokku events:on`, within seconds of a deploy or restart. On most hosts a refresh makes the same number of `dokku` calls however many apps you have, so it stays fast over SSH.
+- **Stays current.** It refreshes on a timer and, if you've run `dokku events:on`, within seconds of a deploy or restart. On most hosts a refresh makes the same number of `dokku` calls however many apps you have, so it stays fast over SSH. While its terminal window is in the background it polls only every 2 minutes, and catches up the moment you switch back (on terminals that report focus, which is most of them; in tmux, `set -g focus-events on`).
 
 ## Get it
 
@@ -36,6 +36,14 @@ curl -fsSL https://raw.githubusercontent.com/offthegully/dokku-ink/main/install.
 ```
 
 The binary needs no Node or Bun. For live data it only needs the `dokku` command on your `PATH`, or an SSH target that has it. Without Dokku it shows demo data.
+
+**Updating:** once a day the dashboard checks for a newer release, and if there is one it shows `↑ 0.x.y (U)` in the header. Press `U` to quit, update and relaunch. You can also update any time from the shell:
+
+```bash
+dokku-ink update
+```
+
+It downloads the matching binary, checks it against the release's `SHA256SUMS`, and swaps it in place. If it's installed somewhere you can't write to (like `/usr/local/bin`), run `sudo dokku-ink update`. Copies older than the `update` command need the install script re-run once.
 
 <details>
 <summary>Other ways to install</summary>
@@ -93,9 +101,8 @@ Each view has the app table on top and details for the selected app below.
 | `↑` / `↓`                  | Select an app (or service)                              |
 | `j` / `k`                  | Scroll the detail pane                                  |
 | `/`                        | Filter the app list (or the cheat sheet)                |
+| `enter`                    | Action menu for the selected app or service; each item has a letter shortcut, and restart/stop/rebuild ask first |
 | `:`                        | Run a dokku command (`↑`/`↓` for history, `esc` to stop) |
-| `R` / `S` / `B`            | Prefill restart / stop / rebuild for the selected app   |
-| `F` / `I`                  | Prefill `logs:failed` / `ps:inspect`                    |
 | `c`                        | Cheat sheet; `enter` copies a command into `:`          |
 | `s`                        | Show / hide secrets                                     |
 | `r`                        | Refresh now                                             |
@@ -138,9 +145,10 @@ git push --follow-tags
 `bun pm version` needs a clean working tree. It updates `package.json`, commits it (e.g. `v0.1.7`), and creates the matching `v0.1.7` tag. A plain `git push` doesn't send tags, so without `--follow-tags` nothing gets built. The workflow then:
 
 1. Cross-compiles the four binaries (`linux`/`darwin` × `x64`/`arm64`) with Bun.
-2. Creates a GitHub Release named after the tag, with auto-generated notes, and attaches the binaries.
+2. Writes a `SHA256SUMS` file for them.
+3. Creates a GitHub Release named after the tag, with auto-generated notes, and attaches the binaries and `SHA256SUMS`.
 
-After that, the install script's default of "latest" picks it up, and running copies show the update in their header within a day.
+After that, the install script's default of "latest" picks it up. Running copies show the update in their header within a day, and `U` or `dokku-ink update` installs it.
 
 Good to know:
 

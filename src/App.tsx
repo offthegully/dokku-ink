@@ -1,15 +1,16 @@
 // Main TUI for dokku-ink: a read-only dashboard over a Dokku host plus a
 // built-in command cheat sheet.
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import {
   theme,
   truncate,
   padEnd,
   padNum,
-  fmtAge,
   fmtAgeDays,
+  fmtFreshness,
+  nextFreshnessChange,
   fmtBytes,
   fmtDate,
   fmtIssuer,
@@ -32,9 +33,11 @@ import {
   runCommand,
   tailLogs,
   watchEvents,
+  DATASTORE_PLUGINS,
 } from './dokku.js';
 import { remoteLabel } from './exec.js';
 import { checkForUpdate } from './update.js';
+import { isFocused, onFocusChange } from './focus.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type {
   AppDetail,
@@ -85,6 +88,12 @@ const FULL_REFRESH_EVERY = 5;
 // `docker stats --no-stream` has to wait out a sampling interval (~2s), so it
 // runs on its own slower timer instead of gating the app list on every poll.
 const STATS_SECONDS = REFRESH_SECONDS ? Math.max(15, REFRESH_SECONDS) : 0;
+// While the terminal window is in the background (see focus.ts), polls and
+// metrics slow to this — slow enough to stop loading the host for nobody,
+// frequent enough that a dashboard left on a second monitor stays roughly
+// current. Pushed events still refresh immediately, and regaining focus
+// catches up at once.
+const BACKGROUND_SECONDS = 120;
 // Datastore services move on human timescales (create/link), not on deploys,
 // so a dataV bump alone doesn't earn the plugin:list + per-service info sweep.
 const SERVICES_TTL_MS = 60_000;
@@ -107,34 +116,72 @@ interface LogLine {
   err: boolean;
 }
 
-// Single-key actions that prefill (never auto-run) the `:` prompt for the
-// selected app. Uppercase so they can't collide with navigation keys.
-const QUICK_ACTIONS: Record<string, string> = {
-  R: 'ps:restart $app',
-  S: 'ps:stop $app',
-  B: 'ps:rebuild $app',
-};
-
-// Read-only single-key actions that prefill the `:` prompt. Unlike
-// QUICK_ACTIONS these are not folded into DESTRUCTIVE_VERBS, because none of
-// them changes anything — `logs:failed` is how you find out why a deploy died.
-const SAFE_ACTIONS: Record<string, string> = {
-  F: 'logs:failed $app',
-  I: 'ps:inspect $app',
-};
-
-// Commands that need a confirm step before running — matched on the typed
-// text itself (not just the R/S/B hotkeys), so hand-typing `ps:stop foo` into
-// `:` gets the same guard as pressing S. The QUICK_ACTIONS verbs are pulled
-// in automatically so a new hotkey can't silently skip confirmation; the rest
-// are other irreversible/data-losing commands reachable from the free-form
-// `:` prompt or the cheat sheet (see cheatsheet.ts's "irreversible" entries).
-const OTHER_DESTRUCTIVE_VERBS = ['apps:destroy', 'domains:clear', 'config:unset'];
-const DESTRUCTIVE_VERBS = [
-  ...new Set(Object.values(QUICK_ACTIONS).map((cmd) => cmd.split(' ')[0])),
-  ...OTHER_DESTRUCTIVE_VERBS,
-];
+// Commands typed into `:` (or inserted from the cheat sheet) that need a
+// confirm step before running: the downtime-causing ps verbs the action menu
+// also confirms, plus irreversible/data-losing ones (see cheatsheet.ts's
+// "irreversible" entries). Matched on the typed text itself, so hand-typing
+// `ps:stop foo` gets the same guard as picking Stop from the menu.
+const DESTRUCTIVE_VERBS = ['ps:restart', 'ps:stop', 'ps:rebuild', 'apps:destroy', 'domains:clear', 'config:unset'];
 const DESTRUCTIVE_RE = new RegExp(`^(${DESTRUCTIVE_VERBS.join('|')})\\b`, 'i');
+
+// Commands that only read state. They skip the refresh that normally follows
+// a `:` command (a full report sweep, plus a services sweep) since there's
+// nothing new to show.
+// Commands after which the services list may have changed: any datastore
+// plugin verb (create/link/destroy…) or app lifecycle (a renamed or destroyed
+// app changes what services show as linked).
+const SERVICES_RE = new RegExp(`^(?:${DATASTORE_PLUGINS.join('|')}|apps):`, 'i');
+const READONLY_RE = /^(?:[\w-]+:)?(?:report|list|show|get|info|inspect|failed|exists|links|help|version|logs)(?:\s|$)/i;
+
+// The Enter menu on a selected app or service. `run` executes straight away,
+// `confirm` asks first (anything that takes the app down), `prefill` drops the
+// command into `:` to be finished (it needs an argument), `cheat` opens the
+// cheat sheet. Each item has a letter that picks it while the menu is open.
+interface MenuItem {
+  key: string;
+  label: string;
+  cmd: string;
+  kind: 'run' | 'confirm' | 'prefill' | 'cheat';
+}
+
+export function appActions(app: DokkuApp, detail?: AppDetail): MenuItem[] {
+  // Prefill Scale with the current formation so it only needs editing.
+  const scale = detail && Object.keys(detail.scale).length > 0
+    ? Object.entries(detail.scale).map(([t, n]) => `${t}=${n}`)
+    : app.processes.map((p) => `${p.type}=${p.scale}`);
+  return [
+    { key: 'r', label: 'Restart', cmd: 'ps:restart $app', kind: 'confirm' },
+    app.running === false
+      ? { key: 's', label: 'Start', cmd: 'ps:start $app', kind: 'run' }
+      : { key: 's', label: 'Stop', cmd: 'ps:stop $app', kind: 'confirm' },
+    { key: 'b', label: 'Rebuild', cmd: 'ps:rebuild $app', kind: 'confirm' },
+    { key: 'f', label: 'Failed deploy logs', cmd: 'logs:failed $app', kind: 'run' },
+    { key: 'i', label: 'Inspect containers', cmd: 'ps:inspect $app', kind: 'run' },
+    { key: 'x', label: 'Scale…', cmd: `ps:scale $app ${scale.join(' ') || 'web=1'}`, kind: 'prefill' },
+    { key: 'e', label: 'Set env var…', cmd: 'config:set $app ', kind: 'prefill' },
+    { key: 'd', label: 'Add domain…', cmd: 'domains:add $app ', kind: 'prefill' },
+    app.ssl?.enabled
+      ? { key: 'l', label: "Renew Let's Encrypt cert", cmd: 'letsencrypt:auto-renew $app', kind: 'run' }
+      : { key: 'l', label: "Enable Let's Encrypt", cmd: 'letsencrypt:enable $app', kind: 'run' },
+    app.locked
+      ? { key: 'o', label: 'Unlock deploys', cmd: 'apps:unlock $app', kind: 'run' }
+      : { key: 'o', label: 'Lock deploys', cmd: 'apps:lock $app', kind: 'run' },
+    { key: 'c', label: 'More commands (cheat sheet)', cmd: '', kind: 'cheat' },
+  ];
+}
+
+export function serviceActions(svc: DokkuService): MenuItem[] {
+  const id = `${svc.plugin}:%s ${svc.name}`;
+  const cmd = (verb: string) => id.replace('%s', verb);
+  return [
+    { key: 'i', label: 'Info', cmd: cmd('info'), kind: 'run' },
+    { key: 'l', label: 'Recent logs', cmd: cmd('logs'), kind: 'run' },
+    { key: 'r', label: 'Restart', cmd: cmd('restart'), kind: 'confirm' },
+    { key: 'a', label: 'Link to app…', cmd: `${cmd('link')} `, kind: 'prefill' },
+    { key: 'u', label: 'Unlink from app…', cmd: `${cmd('unlink')} `, kind: 'prefill' },
+    { key: 'c', label: 'More commands (cheat sheet)', cmd: '', kind: 'cheat' },
+  ];
+}
 
 // Strips the optional leading "dokku " a user may type — the one true
 // normalization startCommand, isDestructive, and the confirm prompt all use,
@@ -198,14 +245,14 @@ function Loading(): ReactNode {
   );
 }
 
-function Header({
+const Header = memo(function Header({
   source,
   host,
   count,
   cert,
   disk,
   refreshing,
-  age,
+  fresh: freshLabel,
   update,
   error,
 }: {
@@ -215,12 +262,12 @@ function Header({
   cert: { app: string; days: number } | null;
   disk: HostDisk | null;
   refreshing: boolean;
-  age: number | null; // seconds since the last successful refresh
+  fresh: string | null; // freshness readout (fmtFreshness), null before the first load
   update?: string | null; // latest release tag when a newer one is available
   error?: string | null; // last refresh failure, if the latest one failed
 }): ReactNode {
   // Fixed-width slot so the readout never nudges the rest of the header.
-  const fresh = refreshing ? '↻ …' : age !== null ? `↻ ${fmtAge(age)}` : '';
+  const fresh = refreshing ? '↻ …' : freshLabel !== null ? `↻ ${freshLabel}` : '';
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Box>
@@ -234,7 +281,9 @@ function Header({
           <Text wrap="truncate-end" color={theme.bad}>⚠ refresh failed{'  '}</Text>
         ) : null}
         {update ? (
-          <Text color={theme.good}>↑ {update.replace(/^v/i, '')}{'  '}</Text>
+          <Text color={theme.good}>
+            ↑ {update.replace(/^v/i, '')} <Text color={theme.dim}>(U)</Text>{'  '}
+          </Text>
         ) : null}
         <Text color={refreshing ? theme.accent : theme.dim}>{padEnd(fresh, 8)}</Text>
         {disk ? (
@@ -262,13 +311,13 @@ function Header({
       </Box>
     </Box>
   );
-}
+});
 
 // One-line view switcher that sits on the detail pane — in per-app views it
 // doubles as the separator between the apps table and the detail below. Full
 // labels when they fit, compact ones otherwise — either way the digits stay
 // visible as the hotkeys. An active `/` filter shows at the end of the strip.
-function TabBar({ view, columns, filter }: { view: number; columns: number; filter?: string }): ReactNode {
+const TabBar = memo(function TabBar({ view, columns, filter }: { view: number; columns: number; filter?: string }): ReactNode {
   const fullWidth = VIEWS.reduce((s, v, i) => s + String(i + 1).length + v.label.length + 5, 2);
   const useShort = fullWidth > columns;
   return (
@@ -295,32 +344,41 @@ function TabBar({ view, columns, filter }: { view: number; columns: number; filt
       {filter ? <Text color={theme.warn}> /{filter}</Text> : null}
     </Box>
   );
-}
+});
 
-function Footer({ view, columns, overlay }: { view: number; columns: number; overlay?: 'cheat' | null }): ReactNode {
+const Footer = memo(function Footer({
+  view,
+  columns,
+  overlay,
+}: {
+  view: number;
+  columns: number;
+  overlay?: 'cheat' | 'menu' | null;
+}): ReactNode {
   const v = VIEWS[view];
   // [key, label, priority] — on narrow terminals the lowest-priority hints are
   // dropped whole rather than letting the layout squeeze every label. `?` is
-  // kept at all costs: it's how the remaining keys stay discoverable.
+  // kept at all costs: it's how the remaining keys stay discoverable. Only
+  // the everyday keys live here; everything else is in `?` or the ↵ menu.
   const keys: Array<[string, string, number]> = [];
   if (overlay === 'cheat') {
     keys.push(['↑↓', 'move', 9]);
     keys.push(['↵', 'insert cmd', 8]);
     keys.push(['/', 'filter', 5]);
-    keys.push([':', 'command', 7]);
-    keys.push(['esc/q', 'close', 10]);
+    keys.push(['esc', 'close', 10]);
+  } else if (overlay === 'menu') {
+    keys.push(['↑↓', 'move', 9]);
+    keys.push(['↵', 'select', 8]);
+    keys.push(['letter', 'shortcut', 5]);
+    keys.push(['esc', 'close', 10]);
   } else {
-    keys.push([`1-${VIEWS.length}`, 'view', 4]);
-    keys.push(['←→', 'switch view', 3]);
-    keys.push(['↑↓', v.perApp ? 'app' : 'move', 9]);
-    if (v.key === 'logs' || v.key === 'config' || v.key === 'process') keys.push(['j/k', 'scroll', 6]);
+    keys.push(['↑↓', v.perApp ? 'app' : 'service', 9]);
+    keys.push(['←→', 'view', 8]);
+    keys.push(['↵', 'actions', 10]);
     if (v.perApp) keys.push(['/', 'filter', 5]);
-    if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal/hide', 5]);
-    if (v.perApp) keys.push(['R/S/B', 'actions', 4]);
-    if (v.perApp) keys.push(['F', 'failed logs', 3]);
+    if (v.key === 'logs' || v.key === 'config' || v.key === 'process') keys.push(['j/k', 'scroll', 4]);
+    if (v.key === 'config' || v.key === 'services') keys.push(['s', 'reveal', 6]);
     keys.push([':', 'command', 7]);
-    keys.push(['c', 'cheats', 6]);
-    keys.push(['r', 'refresh', 2]);
     keys.push(['?', 'help', 10]);
     keys.push(['q', 'quit', 8]);
   }
@@ -355,7 +413,7 @@ function Footer({ view, columns, overlay }: { view: number; columns: number; ove
       ))}
     </Box>
   );
-}
+});
 
 // The `:` prompt that replaces the footer while a command is being typed.
 function CommandBar({ text, app }: { text: string; app?: string }): ReactNode {
@@ -589,7 +647,7 @@ function AppSummary({
 
 // The always-visible apps table on top of every per-app view. ↑↓ moves the
 // selection; the detail pane below tracks it.
-function AppTable({
+const AppTable = memo(function AppTable({
   apps,
   stats,
   selected,
@@ -660,7 +718,7 @@ function AppTable({
       {windowHint(apps.length, start, items.length)}
     </Box>
   );
-}
+});
 
 // Shared first line of every per-app view: name, run state, live usage. `extra`
 // is a node, not a string, so callers can colour part of the trailing facts
@@ -976,7 +1034,7 @@ function serviceStatusColor(status: string | null): string {
 
 // The Services view's master list — sits in the top box where the apps table
 // lives on per-app views, so switching to tab 6 keeps the same skeleton.
-function ServicesTable({
+const ServicesTable = memo(function ServicesTable({
   services,
   loading,
   cursor,
@@ -1021,7 +1079,7 @@ function ServicesTable({
       {windowHint(list.length, start, items.length)}
     </Box>
   );
-}
+});
 
 // The Services view's detail pane: everything about the selected service,
 // mirroring the labeled-rows shape of the app Overview pane.
@@ -1096,24 +1154,79 @@ function ServiceDetail({
   );
 }
 
+// The ↵ menu's body: one row per action with its letter, label and the exact
+// command it runs (with $app resolved), so nothing runs unannounced.
+function ActionMenu({
+  title,
+  items,
+  cursor,
+  viewport,
+  width,
+  appName,
+}: {
+  title: string;
+  items: MenuItem[];
+  cursor: number;
+  viewport: number;
+  width: number;
+  appName?: string;
+}): ReactNode {
+  const labelW = Math.max(...items.map((m) => m.label.length)) + 2;
+  // Title row, plus a row for the window hint when the list overflows.
+  const rows = Math.max(1, viewport - 1 - (items.length > viewport - 1 ? 1 : 0));
+  const { start, items: shown } = windowed(items, cursor, rows);
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end">
+        <Text bold color={theme.accent}>
+          {title}
+        </Text>
+        <Text color={theme.dim}>{'  '}· actions</Text>
+      </Text>
+      {shown.map((m, i) => {
+        const sel = start + i === cursor;
+        const hint =
+          m.kind === 'cheat'
+            ? ''
+            : `${resolveAppPlaceholder(m.cmd, appName).trim()}${m.kind === 'prefill' ? ' …' : ''}`;
+        return (
+          <Box key={m.key}>
+            <Text color={theme.accent}>{sel ? '› ' : '  '}</Text>
+            <Text bold color={sel ? 'black' : theme.accent} backgroundColor={sel ? theme.accent : undefined}>
+              {m.key}
+            </Text>
+            <Text color={sel ? 'black' : m.kind === 'confirm' ? theme.warn : theme.text} backgroundColor={sel ? theme.accent : undefined}>
+              {' '}
+              {padEnd(m.label, labelW)}
+            </Text>
+            <Text wrap="truncate-end" color={theme.dim}>
+              {truncate(hint, Math.max(0, width - labelW - 4))}
+            </Text>
+          </Box>
+        );
+      })}
+      {windowHint(items.length, start, shown.length)}
+    </Box>
+  );
+}
+
 function HelpView(): ReactNode {
   // Key column is padded to the widest key so the two columns stay aligned;
   // padEnd truncates anything longer, so keep this >= the longest key below.
   const keyW = 26;
   const rows: Array<[string, string] | null> = [
-    [`1-${VIEWS.length}`, 'jump to a view'],
-    ['←→ / hl / tab', 'next / previous view'],
     ['↑↓', 'select app · move in lists'],
-    ['j / k', 'scroll the detail pane (logs, config)'],
-    ['c', 'open the command cheat sheet (enter inserts into `:`)'],
-    ['esc', 'close overlay · cancel prompt · kill running command'],
+    ['←→ / hl / tab / 1-' + VIEWS.length, 'switch view'],
+    ['j / k', 'scroll the detail pane (logs, config, processes)'],
     ['/', 'filter the app list (or cheat sheet) · esc clears'],
     ['s', 'reveal/hide secrets (Config values, service DSN)'],
+    ['esc', 'close overlay · cancel prompt · kill running command'],
     null,
-    ['R / S / B', 'prefill restart / stop / rebuild for the selected app (enter confirms)'],
-    ['F / I', 'prefill logs:failed / ps:inspect for the selected app'],
+    ['↵ enter', 'actions for the selected app or service (restart, stop, scale, …)'],
     [':', 'type any dokku command ($app → selected app, ↑↓ history)'],
+    ['c', 'command cheat sheet (enter inserts into `:`)'],
     ['r', 'refresh now (full report sweep)'],
+    ['U', 'update to the new release when ↑ shows (quits, updates, relaunches)'],
     ['q / ctrl-c', 'quit'],
     null,
     ['DOKKU_INK_SSH', 'run remotely: dokku@host (dokku commands only) or user@host'],
@@ -1283,7 +1396,10 @@ function windowHint(total: number, start: number, shown: number): ReactNode {
 // App
 // ---------------------------------------------------------------------------
 
-export default function App({ version }: { version?: string } = {}): ReactNode {
+export default function App({
+  version,
+  onUpdate,
+}: { version?: string; onUpdate?: () => void } = {}): ReactNode {
   const { exit } = useApp();
   const { columns, rows } = useTerminalSize();
 
@@ -1296,30 +1412,44 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   const [cheatCursor, setCheatCursor] = useState(1); // first item under first group
   const [cheatOpen, setCheatOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // The ↵ action menu for the selected app/service. `confirming` is the
+  // second step for a risky item (restart/stop/rebuild): y/↵ runs, n/esc backs
+  // out to the menu.
+  const [menu, setMenu] = useState<{ cursor: number; confirming: boolean } | null>(null);
   // Latest release tag when a newer one exists (else null) — shown as a chip in
   // the header. Resolved once on mount, off the render path.
   const [update, setUpdate] = useState<string | null>(null);
+  // Whether the terminal window has focus; always true on terminals that
+  // don't report it.
+  const [focused, setFocused] = useState(isFocused);
+  useEffect(() => onFocusChange(setFocused), []);
 
-  const [data, setData] = useState<Overview | null>(null);
+  // Everything a refresh produces lives in one state object. Ink renders in
+  // React's legacy mode, where setState calls after an `await` aren't
+  // batched — as separate states, one refresh cost up to six full renders.
+  //   dataV: bumped on every successful *full* refresh; config/services/
+  //          detail entries carry the version they were fetched under, so
+  //          stale ones refetch silently on the next look.
+  //   loadError: surfaced in the header (a refresh that threw used to fail
+  //          silently).
+  const [snap, setSnap] = useState<{
+    data: Overview | null;
+    loading: boolean;
+    refreshing: boolean;
+    dataV: number;
+    lastUpdated: number | null;
+    loadError: string | null;
+  }>({ data: null, loading: true, refreshing: false, dataV: 0, lastUpdated: null, loadError: null });
+  const { data, loading, refreshing, dataV, lastUpdated, loadError } = snap;
   const [stats, setStats] = useState<StatsResult | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  // Bumped on every successful *full* refresh; config/services/detail entries
-  // carry the version they were fetched under, so stale ones refetch silently
-  // on the next look.
-  const [dataV, setDataV] = useState(0);
-  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  // Surfaced in the header: a refresh that threw used to fail silently.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // The per-app caches double as loading state: no entry yet means a fetch
+  // is pending (a separate flag cost an extra render per fetch).
   const [configCache, setConfigCache] = useState<Record<string, { vars: Record<string, string>; v: number }>>({});
-  const [configLoading, setConfigLoading] = useState(false);
   const [services, setServices] = useState<{ list: DokkuService[]; v: number; at: number } | null>(null);
-  const [servicesLoading, setServicesLoading] = useState(false);
   // Set by `r` and `:` commands: the next dataV bump refetches services even
   // inside the TTL, since those are exactly when a service may have changed.
   const servicesStale = useRef(false);
   const [detailCache, setDetailCache] = useState<Record<string, { detail: AppDetail; v: number }>>({});
-  const [detailLoading, setDetailLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
 
   // `/` filters — one for the app list (shared by every app-listing view) and
@@ -1348,27 +1478,41 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   const appFilterLive = filterInput !== null && filterTarget === 'apps' ? filterInput : appFilter;
   const cheatFilterLive = filterInput !== null && filterTarget === 'cheat' ? filterInput : cheatFilter;
 
-  const allApps = data ? data.apps : [];
-  const apps = appFilterLive
-    ? allApps.filter((a) => a.name.toLowerCase().includes(appFilterLive.toLowerCase()))
-    : allApps;
+  const allApps = useMemo(() => (data ? data.apps : []), [data]);
+  // Memoized so the (memoized) AppTable only re-renders when the list or the
+  // selection actually changes — not on every clock tick or log flush.
+  const apps = useMemo(
+    () =>
+      appFilterLive
+        ? allApps.filter((a) => a.name.toLowerCase().includes(appFilterLive.toLowerCase()))
+        : allApps,
+    [allApps, appFilterLive],
+  );
   const currentApp: DokkuApp | undefined = apps[selectedApp];
+  // Per-app loaders key on the name, not the object: every poll rebuilds the
+  // app objects, and depending on identity cancelled (and re-spawned) any
+  // detail/config fetch that happened to be in flight when a poll landed.
+  const currentName = currentApp?.name;
   const statsMap: StatsMap | null = stats?.stats ?? null;
+  const cert = useMemo(() => soonestCert(allApps), [allApps]);
 
   // One refresh path for launch, `r`, the poll timer and pushed events — it
   // never flashes the spinner and never drops caches; versioning (dataV)
   // invalidates config entries instead. Light mode re-fetches only process
   // status + docker stats and keeps the rest of the previous snapshot.
   const dataRef = useRef<Overview | null>(null);
+  const lastUpdatedRef = useRef<number | null>(null);
   useEffect(() => {
     dataRef.current = data;
-  }, [data]);
+    lastUpdatedRef.current = lastUpdated;
+  }, [data, lastUpdated]);
   const refreshInFlight = useRef(false);
   const firstLoadDone = useRef(false);
+  const lastFullAt = useRef(0);
   const refresh = useCallback(async (mode: 'full' | 'light' = 'full') => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
-    setRefreshing(true);
+    setSnap((s) => ({ ...s, refreshing: true }));
     // try/finally is load-bearing: without it a single throw left the
     // in-flight flag stuck true, which killed the poll timer, `r` and the
     // events watcher for the rest of the session with no visible error.
@@ -1376,20 +1520,25 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       const prev = dataRef.current;
       const light = mode === 'light' && prev !== null;
       const result = light ? await loadOverviewLight(prev!) : await loadOverview();
-      setData(result);
       // The very first load must not bump dataV. Every lazy loader tags its
       // cache entry with the dataV it fetched under, so bumping here threw
       // away and re-fetched everything that was in flight during startup
       // (services were fetched twice on every launch).
-      if (!light && firstLoadDone.current) setDataV((v) => v + 1);
+      const bump = !light && firstLoadDone.current;
+      if (!light) lastFullAt.current = Date.now();
       firstLoadDone.current = true;
-      setLastUpdated(Date.now());
-      setLoadError(null);
+      setSnap((s) => ({
+        data: result,
+        loading: false,
+        refreshing: false,
+        dataV: bump ? s.dataV + 1 : s.dataV,
+        lastUpdated: Date.now(),
+        loadError: null,
+      }));
     } catch (e) {
-      setLoadError((e as Error).message || String(e));
+      const loadError = (e as Error).message || String(e);
+      setSnap((s) => ({ ...s, loading: false, refreshing: false, loadError }));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
       refreshInFlight.current = false;
     }
   }, []);
@@ -1399,32 +1548,34 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // alongside the overview delayed every paint — the first one included — by
   // that much, and held the header's ↻ spinner on for the whole poll.
   const statsInFlight = useRef(false);
-  const sampleStats = useRef<() => void>(() => {});
-  useEffect(() => {
-    let cancelled = false;
-    const sample = async () => {
-      if (statsInFlight.current) return;
-      statsInFlight.current = true;
-      try {
-        const s = await loadStats();
-        if (!cancelled) setStats(s);
-      } catch {
-        // Metrics are a nicety — keep showing the last sample.
-      } finally {
-        statsInFlight.current = false;
-      }
-    };
-    sampleStats.current = () => void sample();
-    void sample();
-    if (!STATS_SECONDS) return () => {
-      cancelled = true;
-    };
-    const t = setInterval(() => void sample(), STATS_SECONDS * 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
+  const statsAt = useRef(0);
+  const unmounted = useRef(false);
+  useEffect(() => () => {
+    unmounted.current = true;
   }, []);
+  const sampleStats = useRef(async () => {
+    if (statsInFlight.current) return;
+    statsInFlight.current = true;
+    try {
+      const s = await loadStats();
+      statsAt.current = Date.now();
+      if (!unmounted.current) setStats(s);
+    } catch {
+      // Metrics are a nicety — keep showing the last sample.
+    } finally {
+      statsInFlight.current = false;
+    }
+  });
+  useEffect(() => {
+    void sampleStats.current();
+  }, []);
+  // The timer is re-armed when focus changes; `focused` picks the cadence.
+  const statsSeconds = !STATS_SECONDS ? 0 : focused ? STATS_SECONDS : Math.max(BACKGROUND_SECONDS, STATS_SECONDS);
+  useEffect(() => {
+    if (!statsSeconds) return;
+    const t = setInterval(() => void sampleStats.current(), statsSeconds * 1000);
+    return () => clearInterval(t);
+  }, [statsSeconds]);
 
   useEffect(() => {
     void refresh('full');
@@ -1445,7 +1596,8 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     };
   }, [version]);
 
-  const pollSeconds = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
+  const activePoll = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
+  const pollSeconds = !activePoll ? 0 : focused ? activePoll : Math.max(BACKGROUND_SECONDS, activePoll);
   const pollCount = useRef(0);
   useEffect(() => {
     if (!pollSeconds) return;
@@ -1455,6 +1607,21 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     }, pollSeconds * 1000);
     return () => clearInterval(t);
   }, [refresh, pollSeconds]);
+
+  // Coming back to the window: catch up straight away instead of showing
+  // background-age data until the next tick. A full sweep if one is overdue,
+  // otherwise the cheap light one; metrics too if their sample is stale.
+  const wasFocused = useRef(focused);
+  useEffect(() => {
+    const regained = focused && !wasFocused.current;
+    wasFocused.current = focused;
+    if (!regained || !activePoll) return;
+    const now = Date.now();
+    if (lastUpdatedRef.current !== null && now - lastUpdatedRef.current < activePoll * 1000) return;
+    const fullDue = now - lastFullAt.current >= activePoll * FULL_REFRESH_EVERY * 1000;
+    void refresh(fullDue ? 'full' : 'light');
+    if (now - statsAt.current >= STATS_SECONDS * 1000) void sampleStats.current();
+  }, [focused, activePoll, refresh]);
 
   // Event-driven refresh: deploys/restarts/scaling show up within ~2s instead
   // of waiting out the poll. Needs `dokku events:on`; otherwise the watcher
@@ -1466,6 +1633,9 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       if (timer) return; // a deploy emits a burst of events — refresh once
       timer = setTimeout(() => {
         timer = null;
+        // A `:` command already refreshes when it finishes, and its own
+        // events land right after — don't sweep twice for one change.
+        if (Date.now() - lastFullAt.current < 3000) return;
         void refresh('full');
       }, 2000);
     });
@@ -1511,9 +1681,12 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       clearInterval(flush);
       flushNow();
       setCmdRun((r) => (r ? { ...r, running: false } : r));
-      servicesStale.current = true;
+      if (READONLY_RE.test(shown)) return; // nothing changed — skip the sweep
+      // Only datastore/app commands can move services; any other verb would
+      // re-sweep every plugin (list + info per service) for nothing.
+      if (SERVICES_RE.test(shown)) servicesStale.current = true;
       void refresh('full'); // the command may have changed state — show it
-      sampleStats.current();
+      void sampleStats.current();
     });
     cmdStopRef.current = () => {
       clearInterval(flush);
@@ -1524,15 +1697,16 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // Kill a still-running command if the whole app unmounts.
   useEffect(() => () => cmdStopRef.current?.(), []);
 
-  // Tick the header's "↻ 12s" freshness readout. Every tick repaints the whole
-  // frame, so the cadence follows what the readout can actually show: 1s while
-  // it counts single seconds, 5s once it's rounded to five (see shownAge),
-  // 30s once it only shows whole minutes.
+  // Tick the header's "↻ now / 15s / 2m" freshness readout. Every tick repaints
+  // the whole frame, so it wakes only when the bucketed label will actually
+  // change (see fmtFreshness) — at most once per 15s, and never at all while
+  // polls keep the data under 15s old.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const age = lastUpdated === null ? 0 : (Date.now() - lastUpdated) / 1000;
-    const period = age < 10 ? 1000 : age < 60 ? 5000 : 30000;
-    const t = setTimeout(() => setNow(Date.now()), period);
+    if (lastUpdated === null) return;
+    const age = (Date.now() - lastUpdated) / 1000;
+    // A hair past the boundary so the new label is already due when we wake.
+    const t = setTimeout(() => setNow(Date.now()), nextFreshnessChange(age) * 1000 + 50);
     return () => clearTimeout(t);
   }, [now, lastUpdated]);
 
@@ -1557,6 +1731,13 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     const first = lines.findIndex((l) => l.type === 'item');
     if (first !== -1) setCheatCursor(first);
   }, [cheatOpen, cheatFilterLive, cheatCursor]);
+
+  // Per-app fetches are debounced only while the selection is moving (holding
+  // ↓ through the list). Landing on an app any other way — startup, a view
+  // switch — fetches straight away instead of idling out the debounce.
+  const lastMoveAt = useRef(0);
+  const moving = () => Date.now() - lastMoveAt.current < APP_FETCH_DEBOUNCE_MS * 2;
+  const fetchDelay = () => (moving() ? APP_FETCH_DEBOUNCE_MS : 0);
 
   // Tail logs while the Logs view is showing an app. Lines are buffered and
   // flushed on an interval so a chatty app doesn't re-render per line.
@@ -1603,14 +1784,14 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       });
     }, 150);
 
-    // Attaching is debounced: every selection change used to kill the old
+    // Attaching is debounced while the selection is moving: every change used to kill the old
     // `dokku logs -t` and spawn a new one (plus its 100-line replay), so
     // holding ↓ through the list spawned one tail per row. The cached seed is
     // shown immediately regardless, so the pane still fills instantly.
     let stop: (() => void) | null = null;
     const attach = setTimeout(() => {
       stop = tailLogs(logApp, source, push, (msg) => push(msg, true));
-    }, LOG_ATTACH_DEBOUNCE_MS);
+    }, moving() ? LOG_ATTACH_DEBOUNCE_MS : 0);
 
     return () => {
       clearTimeout(attach);
@@ -1626,26 +1807,24 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // fetched under an older dataV refetches silently (stale values stay on
   // screen meanwhile) so the view tracks `r`, the poll and pushed events.
   useEffect(() => {
-    if (currentView.key !== 'config' || !currentApp) return;
-    const entry = configCache[currentApp.name];
+    if (currentView.key !== 'config' || !currentName) return;
+    const entry = configCache[currentName];
     if (entry && entry.v === dataV) return;
     let cancelled = false;
-    if (!entry) setConfigLoading(true);
     // Debounced like the detail loader: holding ↓ through the app list used to
     // fire a `config:show` per row. The cancelled flag only dropped the
     // result — the subprocess had already run.
     const t = setTimeout(() => {
-      void loadConfig(currentApp.name, source).then((res) => {
+      void loadConfig(currentName, source).then((res) => {
         if (cancelled) return;
-        setConfigCache((c) => ({ ...c, [currentApp.name]: { vars: res.vars, v: dataV } }));
-        setConfigLoading(false);
+        setConfigCache((c) => ({ ...c, [currentName]: { vars: res.vars, v: dataV } }));
       });
-    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
+    }, entry ? 0 : fetchDelay());
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [currentView.key, currentApp, source, configCache, dataV]);
+  }, [currentView.key, currentName, source, configCache, dataV]);
 
   // Lazily load datastore services when a view needs them (Services itself,
   // plus the Apps summary pane's LINKED line); refetch when dataV moves.
@@ -1660,12 +1839,10 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       (services.v === dataV || Date.now() - services.at < SERVICES_TTL_MS)
     ) return;
     let cancelled = false;
-    if (!services) setServicesLoading(true);
     void loadServices().then((res) => {
       if (cancelled) return;
       servicesStale.current = false;
       setServices({ list: res.services, v: dataV, at: Date.now() });
-      setServicesLoading(false);
     });
     return () => {
       cancelled = true;
@@ -1678,23 +1855,21 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   // sweep per row.
   const wantDetail = currentView.perApp;
   useEffect(() => {
-    if (!wantDetail || !currentApp) return;
-    const entry = detailCache[currentApp.name];
+    if (!wantDetail || !currentName) return;
+    const entry = detailCache[currentName];
     if (entry && entry.v === dataV) return;
     let cancelled = false;
-    if (!entry) setDetailLoading(true);
     const t = setTimeout(() => {
-      void loadAppDetail(currentApp.name, source).then((d) => {
+      void loadAppDetail(currentName, source).then((d) => {
         if (cancelled) return;
-        setDetailCache((c) => ({ ...c, [currentApp.name]: { detail: d, v: dataV } }));
-        setDetailLoading(false);
+        setDetailCache((c) => ({ ...c, [currentName]: { detail: d, v: dataV } }));
       });
-    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
+    }, entry ? 0 : fetchDelay());
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [wantDetail, currentApp, source, detailCache, dataV]);
+  }, [wantDetail, currentName, source, detailCache, dataV]);
 
   // Layout sizing. Every view stacks two bordered boxes between header and
   // footer — the master table on top (apps, or services on tab 6), the tabbed
@@ -1718,12 +1893,29 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     setScroll((s) => Math.min(Math.max(0, s + delta), Math.max(0, total - shown)));
   }, [detailViewport]);
 
-  // Prefill a quick action into the `:` prompt (never auto-runs).
-  const quickAction = (ch: string): boolean => {
-    const cmd = QUICK_ACTIONS[ch] ?? SAFE_ACTIONS[ch];
-    if (!cmd || !currentApp) return false;
-    setCmdInput(cmd);
-    return true;
+  // Items for the ↵ menu, rebuilt from live state so Stop/Start and
+  // Lock/Unlock track the app as it changes underneath an open menu.
+  const currentService = currentView.key === 'services' ? services?.list[svcCursor] : undefined;
+  const menuItems: MenuItem[] = !menu
+    ? []
+    : currentView.perApp
+      ? currentApp
+        ? appActions(currentApp, detailCache[currentApp.name]?.detail)
+        : []
+      : currentService
+        ? serviceActions(currentService)
+        : [];
+  const menuTitle = currentView.perApp ? currentApp?.name : currentService && `${currentService.plugin}/${currentService.name}`;
+
+  const pickMenuItem = (item: MenuItem) => {
+    if (item.kind === 'confirm') {
+      setMenu((m) => (m ? { ...m, confirming: true } : m));
+      return;
+    }
+    setMenu(null);
+    if (item.kind === 'cheat') setCheatOpen(true);
+    else if (item.kind === 'prefill') setCmdInput(item.cmd);
+    else startCommand(item.cmd);
   };
 
   useInput((input, key) => {
@@ -1875,7 +2067,51 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       return;
     }
 
+    // Action menu: ↑↓/jk move, ↵ or an item's letter picks, esc/q closes.
+    if (menu) {
+      const item = menuItems[Math.min(menu.cursor, menuItems.length - 1)];
+      if (menu.confirming) {
+        if (key.escape || input === 'n' || input === 'N') {
+          setMenu({ ...menu, confirming: false });
+        } else if ((key.return || input === 'y' || input === 'Y') && item) {
+          setMenu(null);
+          startCommand(item.cmd);
+        }
+        return;
+      }
+      if (key.escape || input === 'q' || menuItems.length === 0) {
+        setMenu(null);
+        return;
+      }
+      if (key.upArrow || key.downArrow || input === 'k' || input === 'j') {
+        const delta = key.upArrow || input === 'k' ? -1 : 1;
+        setMenu({ ...menu, cursor: (menu.cursor + delta + menuItems.length) % menuItems.length });
+        return;
+      }
+      if (key.return && item) {
+        pickMenuItem(item);
+        return;
+      }
+      const byKey = menuItems.findIndex((m) => m.key === input);
+      if (byKey !== -1) {
+        setMenu({ ...menu, cursor: byKey });
+        pickMenuItem(menuItems[byKey]);
+      }
+      return;
+    }
+
     if (input === 'q') {
+      exit();
+      return;
+    }
+    if (key.return && (currentView.perApp ? currentApp : currentService)) {
+      setMenu({ cursor: 0, confirming: false });
+      return;
+    }
+    // Only live when the header shows ↑; the entry point runs the actual
+    // download once Ink has let go of the terminal.
+    if (input === 'U' && update && onUpdate) {
+      onUpdate();
       exit();
       return;
     }
@@ -1906,7 +2142,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     if (input === 'r') {
       servicesStale.current = true;
       void refresh('full');
-      sampleStats.current();
+      void sampleStats.current();
       return;
     }
     if (input === 's' && currentView.key === 'config') {
@@ -1917,7 +2153,6 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       setSvcReveal((v) => !v);
       return;
     }
-    if (currentView.perApp && quickAction(input)) return;
 
     // ←/→ (h/l) steps through the detail tabs, wrapping like tab does.
     const left = key.leftArrow || input === 'h';
@@ -1936,6 +2171,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       // Arrows always move the app selection; j/k scrolls the detail pane
       // content (log scrollback, long config lists) without a mode switch.
       if (up || down) {
+        lastMoveAt.current = Date.now();
         setSelectedApp((i) => Math.min(Math.max(0, i + (down ? 1 : -1)), apps.length - 1));
         setScroll(0);
         return;
@@ -1972,7 +2208,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} age={null} update={update} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} fresh={null} update={update} />
         <Loading />
       </Box>
     );
@@ -1986,7 +2222,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         <AppSummary
           app={currentApp}
           detail={currentDetail}
-          loading={detailLoading}
+          loading={!currentDetail}
           services={services ? services.list : null}
           width={colBudget}
         />
@@ -2010,7 +2246,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         <ConfigView
           app={currentApp}
           config={currentApp ? configCache[currentApp.name]?.vars : {}}
-          loading={configLoading && !(currentApp && configCache[currentApp.name])}
+          loading={!(currentApp && configCache[currentApp.name])}
           reveal={reveal}
           viewport={detailViewport}
           scroll={scroll}
@@ -2029,6 +2265,20 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
         />
       );
       break;
+  }
+  // The action menu stands in for the detail pane, so the table above still
+  // shows which app (or service) it's acting on.
+  if (menu && menuItems.length > 0) {
+    content = (
+      <ActionMenu
+        title={menuTitle ?? ''}
+        items={menuItems}
+        cursor={Math.min(menu.cursor, menuItems.length - 1)}
+        viewport={detailViewport}
+        width={colBudget}
+        appName={currentApp?.name}
+      />
+    );
   }
   // Overlays take over the whole pane until dismissed.
   let overlayTitle: string | null = null;
@@ -2068,7 +2318,7 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     currentView.key === 'services' ? (
       <ServicesTable
         services={services?.list ?? null}
-        loading={servicesLoading}
+        loading={!services}
         cursor={svcCursor}
         height={tableRows}
       />
@@ -2077,20 +2327,17 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
     );
 
   const activeFilter = currentView.perApp ? appFilterLive : '';
-  // Rounded the same way the ticker above is paced, so the readout never shows
-  // a number it isn't refreshing often enough to keep true.
-  const rawAge = lastUpdated === null ? null : Math.max(0, Math.round((now - lastUpdated) / 1000));
-  const shownAge = rawAge === null || rawAge < 10 ? rawAge : rawAge < 60 ? Math.floor(rawAge / 5) * 5 : rawAge;
+  const freshLabel = lastUpdated === null ? null : fmtFreshness(Math.max(0, (now - lastUpdated) / 1000));
   return (
     <Box flexDirection="column" height={rows}>
       <Header
         source={source}
         host={hostLabel()}
         count={allApps.length}
-        cert={soonestCert(allApps)}
+        cert={cert}
         disk={stats?.disk ?? null}
         refreshing={refreshing && !loading}
-        age={shownAge}
+        fresh={freshLabel}
         update={update}
         error={loadError}
       />
@@ -2123,7 +2370,9 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
           </Box>
         </>
       )}
-      {cmdInput !== null ? (
+      {menu?.confirming && menuItems[menu.cursor] ? (
+        <ConfirmBar cmd={menuItems[menu.cursor].cmd} app={currentApp?.name} />
+      ) : cmdInput !== null ? (
         cmdConfirm !== null ? (
           <ConfirmBar cmd={cmdConfirm} app={currentApp?.name} />
         ) : (
@@ -2132,7 +2381,11 @@ export default function App({ version }: { version?: string } = {}): ReactNode {
       ) : filterInput !== null ? (
         <FilterBar text={filterInput} target={filterTarget === 'cheat' ? 'cheat sheet' : 'apps'} />
       ) : (
-        <Footer view={view} columns={columns} overlay={cheatOpen && !cmdRun && !helpOpen ? 'cheat' : null} />
+        <Footer
+          view={view}
+          columns={columns}
+          overlay={cheatOpen && !cmdRun && !helpOpen ? 'cheat' : menu && menuItems.length > 0 && !cmdRun && !helpOpen ? 'menu' : null}
+        />
       )}
     </Box>
   );
