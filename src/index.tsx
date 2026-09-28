@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { render } from 'ink';
 import App from './App.js';
+import { enableFocusReporting, focusAwareStdin } from './focus.js';
 
 // The version is baked in at compile time for the standalone binary (see
 // scripts/build.ts, which replaces __DOKKU_INK_VERSION__ via --define). When
@@ -82,11 +83,21 @@ const syncStdout = process.stdout.isTTY
 // Pressing `U` in the dashboard sets this and quits; the update itself runs
 // after Ink has released the terminal so its progress prints normally.
 let updateRequested = false;
+// Focus reporting lets the dashboard poll less while its window is in the
+// background (see focus.ts). The 'exit' hook turns it off even on a crash, so
+// the shell isn't left receiving ESC[I / ESC[O after we're gone.
+const focusOff = process.stdin.isTTY ? enableFocusReporting(process.stdout) : () => {};
+process.on('exit', focusOff);
 const { waitUntilExit } = render(
   <App version={version} onUpdate={() => (updateRequested = true)} />,
-  { stdout: syncStdout, exitOnCtrlC: false },
+  {
+    stdout: syncStdout,
+    stdin: process.stdin.isTTY ? focusAwareStdin(process.stdin) : process.stdin,
+    exitOnCtrlC: false,
+  },
 );
 await waitUntilExit();
+focusOff();
 
 if (updateRequested) {
   const { selfUpdate } = await import('./update.js');

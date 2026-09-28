@@ -53,6 +53,24 @@ export function fmtAge(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h`;
 }
 
+// The header's "↻ …" freshness readout, bucketed so it changes — and forces
+// a repaint — rarely: "now" for the first 15s, then 15s steps, then whole
+// minutes and hours. At the default poll cadence it reads "now" or "15s" and
+// repaints about once per poll instead of every second.
+export function fmtFreshness(seconds: number): string {
+  if (seconds < 15) return 'now';
+  if (seconds < 60) return `${Math.floor(seconds / 15) * 15}s`;
+  return fmtAge(Math.floor(seconds));
+}
+
+/** Seconds until fmtFreshness(seconds) shows something different. */
+export function nextFreshnessChange(seconds: number): number {
+  const s = Math.max(0, seconds);
+  if (s < 60) return 15 - (s % 15);
+  if (s < 3600) return 60 - (s % 60);
+  return 3600 - (s % 3600);
+}
+
 // Compact "how old" for the apps table AGE column: 13d, 3mo, 1.2y.
 export function fmtAgeDays(iso: string | null | undefined): string {
   const days = daysUntil(iso);

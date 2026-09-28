@@ -25,7 +25,7 @@ A terminal dashboard for [Dokku](https://dokku.com/). It's a single self-contain
 - **See everything at once.** Each app's run state, process scale, CPU/memory, domains, certificate expiry, health checks, linked databases and more, in one table you move through with the arrow keys.
 - **Run any Dokku command in place.** Press `:` and type it. `$app` expands to the selected app, output streams live, and the dashboard refreshes afterward. Press `enter` on an app or service for a menu of common actions (restart, stop/start, rebuild, scale, failed logs, Let's Encrypt, lock…), and `c` opens a searchable cheat sheet of common commands.
 - **Safe by default.** Destructive commands ask for confirmation. Secrets stay masked until you press `s`. Commands run without a shell, so pipes and `;` do nothing.
-- **Stays current.** It refreshes on a timer and, if you've run `dokku events:on`, within seconds of a deploy or restart. On most hosts a refresh makes the same number of `dokku` calls however many apps you have, so it stays fast over SSH.
+- **Stays current.** It refreshes on a timer and, if you've run `dokku events:on`, within seconds of a deploy or restart. On most hosts a refresh makes the same number of `dokku` calls however many apps you have, so it stays fast over SSH. While its terminal window is in the background it polls only every 2 minutes, and catches up the moment you switch back (on terminals that report focus, which is most of them; in tmux, `set -g focus-events on`).
 
 ## Get it
 

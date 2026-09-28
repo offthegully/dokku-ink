@@ -8,8 +8,9 @@ import {
   truncate,
   padEnd,
   padNum,
-  fmtAge,
   fmtAgeDays,
+  fmtFreshness,
+  nextFreshnessChange,
   fmtBytes,
   fmtDate,
   fmtIssuer,
@@ -36,6 +37,7 @@ import {
 } from './dokku.js';
 import { remoteLabel } from './exec.js';
 import { checkForUpdate } from './update.js';
+import { isFocused, onFocusChange } from './focus.js';
 import { CHEATSHEET } from './cheatsheet.js';
 import type {
   AppDetail,
@@ -86,6 +88,12 @@ const FULL_REFRESH_EVERY = 5;
 // `docker stats --no-stream` has to wait out a sampling interval (~2s), so it
 // runs on its own slower timer instead of gating the app list on every poll.
 const STATS_SECONDS = REFRESH_SECONDS ? Math.max(15, REFRESH_SECONDS) : 0;
+// While the terminal window is in the background (see focus.ts), polls and
+// metrics slow to this — slow enough to stop loading the host for nobody,
+// frequent enough that a dashboard left on a second monitor stays roughly
+// current. Pushed events still refresh immediately, and regaining focus
+// catches up at once.
+const BACKGROUND_SECONDS = 120;
 // Datastore services move on human timescales (create/link), not on deploys,
 // so a dataV bump alone doesn't earn the plugin:list + per-service info sweep.
 const SERVICES_TTL_MS = 60_000;
@@ -244,7 +252,7 @@ const Header = memo(function Header({
   cert,
   disk,
   refreshing,
-  age,
+  fresh: freshLabel,
   update,
   error,
 }: {
@@ -254,12 +262,12 @@ const Header = memo(function Header({
   cert: { app: string; days: number } | null;
   disk: HostDisk | null;
   refreshing: boolean;
-  age: number | null; // seconds since the last successful refresh
+  fresh: string | null; // freshness readout (fmtFreshness), null before the first load
   update?: string | null; // latest release tag when a newer one is available
   error?: string | null; // last refresh failure, if the latest one failed
 }): ReactNode {
   // Fixed-width slot so the readout never nudges the rest of the header.
-  const fresh = refreshing ? '↻ …' : age !== null ? `↻ ${fmtAge(age)}` : '';
+  const fresh = refreshing ? '↻ …' : freshLabel !== null ? `↻ ${freshLabel}` : '';
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Box>
@@ -1411,27 +1419,37 @@ export default function App({
   // Latest release tag when a newer one exists (else null) — shown as a chip in
   // the header. Resolved once on mount, off the render path.
   const [update, setUpdate] = useState<string | null>(null);
+  // Whether the terminal window has focus; always true on terminals that
+  // don't report it.
+  const [focused, setFocused] = useState(isFocused);
+  useEffect(() => onFocusChange(setFocused), []);
 
-  const [data, setData] = useState<Overview | null>(null);
+  // Everything a refresh produces lives in one state object. Ink renders in
+  // React's legacy mode, where setState calls after an `await` aren't
+  // batched — as separate states, one refresh cost up to six full renders.
+  //   dataV: bumped on every successful *full* refresh; config/services/
+  //          detail entries carry the version they were fetched under, so
+  //          stale ones refetch silently on the next look.
+  //   loadError: surfaced in the header (a refresh that threw used to fail
+  //          silently).
+  const [snap, setSnap] = useState<{
+    data: Overview | null;
+    loading: boolean;
+    refreshing: boolean;
+    dataV: number;
+    lastUpdated: number | null;
+    loadError: string | null;
+  }>({ data: null, loading: true, refreshing: false, dataV: 0, lastUpdated: null, loadError: null });
+  const { data, loading, refreshing, dataV, lastUpdated, loadError } = snap;
   const [stats, setStats] = useState<StatsResult | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  // Bumped on every successful *full* refresh; config/services/detail entries
-  // carry the version they were fetched under, so stale ones refetch silently
-  // on the next look.
-  const [dataV, setDataV] = useState(0);
-  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  // Surfaced in the header: a refresh that threw used to fail silently.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // The per-app caches double as loading state: no entry yet means a fetch
+  // is pending (a separate flag cost an extra render per fetch).
   const [configCache, setConfigCache] = useState<Record<string, { vars: Record<string, string>; v: number }>>({});
-  const [configLoading, setConfigLoading] = useState(false);
   const [services, setServices] = useState<{ list: DokkuService[]; v: number; at: number } | null>(null);
-  const [servicesLoading, setServicesLoading] = useState(false);
   // Set by `r` and `:` commands: the next dataV bump refetches services even
   // inside the TTL, since those are exactly when a service may have changed.
   const servicesStale = useRef(false);
   const [detailCache, setDetailCache] = useState<Record<string, { detail: AppDetail; v: number }>>({});
-  const [detailLoading, setDetailLoading] = useState(false);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
 
   // `/` filters — one for the app list (shared by every app-listing view) and
@@ -1483,16 +1501,18 @@ export default function App({
   // invalidates config entries instead. Light mode re-fetches only process
   // status + docker stats and keeps the rest of the previous snapshot.
   const dataRef = useRef<Overview | null>(null);
+  const lastUpdatedRef = useRef<number | null>(null);
   useEffect(() => {
     dataRef.current = data;
-  }, [data]);
+    lastUpdatedRef.current = lastUpdated;
+  }, [data, lastUpdated]);
   const refreshInFlight = useRef(false);
   const firstLoadDone = useRef(false);
   const lastFullAt = useRef(0);
   const refresh = useCallback(async (mode: 'full' | 'light' = 'full') => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
-    setRefreshing(true);
+    setSnap((s) => ({ ...s, refreshing: true }));
     // try/finally is load-bearing: without it a single throw left the
     // in-flight flag stuck true, which killed the poll timer, `r` and the
     // events watcher for the rest of the session with no visible error.
@@ -1500,21 +1520,25 @@ export default function App({
       const prev = dataRef.current;
       const light = mode === 'light' && prev !== null;
       const result = light ? await loadOverviewLight(prev!) : await loadOverview();
-      setData(result);
       // The very first load must not bump dataV. Every lazy loader tags its
       // cache entry with the dataV it fetched under, so bumping here threw
       // away and re-fetched everything that was in flight during startup
       // (services were fetched twice on every launch).
-      if (!light && firstLoadDone.current) setDataV((v) => v + 1);
+      const bump = !light && firstLoadDone.current;
       if (!light) lastFullAt.current = Date.now();
       firstLoadDone.current = true;
-      setLastUpdated(Date.now());
-      setLoadError(null);
+      setSnap((s) => ({
+        data: result,
+        loading: false,
+        refreshing: false,
+        dataV: bump ? s.dataV + 1 : s.dataV,
+        lastUpdated: Date.now(),
+        loadError: null,
+      }));
     } catch (e) {
-      setLoadError((e as Error).message || String(e));
+      const loadError = (e as Error).message || String(e);
+      setSnap((s) => ({ ...s, loading: false, refreshing: false, loadError }));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
       refreshInFlight.current = false;
     }
   }, []);
@@ -1524,32 +1548,34 @@ export default function App({
   // alongside the overview delayed every paint — the first one included — by
   // that much, and held the header's ↻ spinner on for the whole poll.
   const statsInFlight = useRef(false);
-  const sampleStats = useRef<() => void>(() => {});
-  useEffect(() => {
-    let cancelled = false;
-    const sample = async () => {
-      if (statsInFlight.current) return;
-      statsInFlight.current = true;
-      try {
-        const s = await loadStats();
-        if (!cancelled) setStats(s);
-      } catch {
-        // Metrics are a nicety — keep showing the last sample.
-      } finally {
-        statsInFlight.current = false;
-      }
-    };
-    sampleStats.current = () => void sample();
-    void sample();
-    if (!STATS_SECONDS) return () => {
-      cancelled = true;
-    };
-    const t = setInterval(() => void sample(), STATS_SECONDS * 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
+  const statsAt = useRef(0);
+  const unmounted = useRef(false);
+  useEffect(() => () => {
+    unmounted.current = true;
   }, []);
+  const sampleStats = useRef(async () => {
+    if (statsInFlight.current) return;
+    statsInFlight.current = true;
+    try {
+      const s = await loadStats();
+      statsAt.current = Date.now();
+      if (!unmounted.current) setStats(s);
+    } catch {
+      // Metrics are a nicety — keep showing the last sample.
+    } finally {
+      statsInFlight.current = false;
+    }
+  });
+  useEffect(() => {
+    void sampleStats.current();
+  }, []);
+  // The timer is re-armed when focus changes; `focused` picks the cadence.
+  const statsSeconds = !STATS_SECONDS ? 0 : focused ? STATS_SECONDS : Math.max(BACKGROUND_SECONDS, STATS_SECONDS);
+  useEffect(() => {
+    if (!statsSeconds) return;
+    const t = setInterval(() => void sampleStats.current(), statsSeconds * 1000);
+    return () => clearInterval(t);
+  }, [statsSeconds]);
 
   useEffect(() => {
     void refresh('full');
@@ -1570,7 +1596,8 @@ export default function App({
     };
   }, [version]);
 
-  const pollSeconds = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
+  const activePoll = currentView.key === 'process' ? FAST_REFRESH_SECONDS : REFRESH_SECONDS;
+  const pollSeconds = !activePoll ? 0 : focused ? activePoll : Math.max(BACKGROUND_SECONDS, activePoll);
   const pollCount = useRef(0);
   useEffect(() => {
     if (!pollSeconds) return;
@@ -1580,6 +1607,21 @@ export default function App({
     }, pollSeconds * 1000);
     return () => clearInterval(t);
   }, [refresh, pollSeconds]);
+
+  // Coming back to the window: catch up straight away instead of showing
+  // background-age data until the next tick. A full sweep if one is overdue,
+  // otherwise the cheap light one; metrics too if their sample is stale.
+  const wasFocused = useRef(focused);
+  useEffect(() => {
+    const regained = focused && !wasFocused.current;
+    wasFocused.current = focused;
+    if (!regained || !activePoll) return;
+    const now = Date.now();
+    if (lastUpdatedRef.current !== null && now - lastUpdatedRef.current < activePoll * 1000) return;
+    const fullDue = now - lastFullAt.current >= activePoll * FULL_REFRESH_EVERY * 1000;
+    void refresh(fullDue ? 'full' : 'light');
+    if (now - statsAt.current >= STATS_SECONDS * 1000) void sampleStats.current();
+  }, [focused, activePoll, refresh]);
 
   // Event-driven refresh: deploys/restarts/scaling show up within ~2s instead
   // of waiting out the poll. Needs `dokku events:on`; otherwise the watcher
@@ -1644,7 +1686,7 @@ export default function App({
       // re-sweep every plugin (list + info per service) for nothing.
       if (SERVICES_RE.test(shown)) servicesStale.current = true;
       void refresh('full'); // the command may have changed state — show it
-      sampleStats.current();
+      void sampleStats.current();
     });
     cmdStopRef.current = () => {
       clearInterval(flush);
@@ -1655,15 +1697,16 @@ export default function App({
   // Kill a still-running command if the whole app unmounts.
   useEffect(() => () => cmdStopRef.current?.(), []);
 
-  // Tick the header's "↻ 12s" freshness readout. Every tick repaints the whole
-  // frame, so the cadence follows what the readout can actually show: 1s while
-  // it counts single seconds, 5s once it's rounded to five (see shownAge),
-  // 30s once it only shows whole minutes.
+  // Tick the header's "↻ now / 15s / 2m" freshness readout. Every tick repaints
+  // the whole frame, so it wakes only when the bucketed label will actually
+  // change (see fmtFreshness) — at most once per 15s, and never at all while
+  // polls keep the data under 15s old.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const age = lastUpdated === null ? 0 : (Date.now() - lastUpdated) / 1000;
-    const period = age < 10 ? 1000 : age < 60 ? 5000 : 30000;
-    const t = setTimeout(() => setNow(Date.now()), period);
+    if (lastUpdated === null) return;
+    const age = (Date.now() - lastUpdated) / 1000;
+    // A hair past the boundary so the new label is already due when we wake.
+    const t = setTimeout(() => setNow(Date.now()), nextFreshnessChange(age) * 1000 + 50);
     return () => clearTimeout(t);
   }, [now, lastUpdated]);
 
@@ -1688,6 +1731,13 @@ export default function App({
     const first = lines.findIndex((l) => l.type === 'item');
     if (first !== -1) setCheatCursor(first);
   }, [cheatOpen, cheatFilterLive, cheatCursor]);
+
+  // Per-app fetches are debounced only while the selection is moving (holding
+  // ↓ through the list). Landing on an app any other way — startup, a view
+  // switch — fetches straight away instead of idling out the debounce.
+  const lastMoveAt = useRef(0);
+  const moving = () => Date.now() - lastMoveAt.current < APP_FETCH_DEBOUNCE_MS * 2;
+  const fetchDelay = () => (moving() ? APP_FETCH_DEBOUNCE_MS : 0);
 
   // Tail logs while the Logs view is showing an app. Lines are buffered and
   // flushed on an interval so a chatty app doesn't re-render per line.
@@ -1734,14 +1784,14 @@ export default function App({
       });
     }, 150);
 
-    // Attaching is debounced: every selection change used to kill the old
+    // Attaching is debounced while the selection is moving: every change used to kill the old
     // `dokku logs -t` and spawn a new one (plus its 100-line replay), so
     // holding ↓ through the list spawned one tail per row. The cached seed is
     // shown immediately regardless, so the pane still fills instantly.
     let stop: (() => void) | null = null;
     const attach = setTimeout(() => {
       stop = tailLogs(logApp, source, push, (msg) => push(msg, true));
-    }, LOG_ATTACH_DEBOUNCE_MS);
+    }, moving() ? LOG_ATTACH_DEBOUNCE_MS : 0);
 
     return () => {
       clearTimeout(attach);
@@ -1761,7 +1811,6 @@ export default function App({
     const entry = configCache[currentName];
     if (entry && entry.v === dataV) return;
     let cancelled = false;
-    if (!entry) setConfigLoading(true);
     // Debounced like the detail loader: holding ↓ through the app list used to
     // fire a `config:show` per row. The cancelled flag only dropped the
     // result — the subprocess had already run.
@@ -1769,9 +1818,8 @@ export default function App({
       void loadConfig(currentName, source).then((res) => {
         if (cancelled) return;
         setConfigCache((c) => ({ ...c, [currentName]: { vars: res.vars, v: dataV } }));
-        setConfigLoading(false);
       });
-    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
+    }, entry ? 0 : fetchDelay());
     return () => {
       cancelled = true;
       clearTimeout(t);
@@ -1791,12 +1839,10 @@ export default function App({
       (services.v === dataV || Date.now() - services.at < SERVICES_TTL_MS)
     ) return;
     let cancelled = false;
-    if (!services) setServicesLoading(true);
     void loadServices().then((res) => {
       if (cancelled) return;
       servicesStale.current = false;
       setServices({ list: res.services, v: dataV, at: Date.now() });
-      setServicesLoading(false);
     });
     return () => {
       cancelled = true;
@@ -1813,14 +1859,12 @@ export default function App({
     const entry = detailCache[currentName];
     if (entry && entry.v === dataV) return;
     let cancelled = false;
-    if (!entry) setDetailLoading(true);
     const t = setTimeout(() => {
       void loadAppDetail(currentName, source).then((d) => {
         if (cancelled) return;
         setDetailCache((c) => ({ ...c, [currentName]: { detail: d, v: dataV } }));
-        setDetailLoading(false);
       });
-    }, entry ? 0 : APP_FETCH_DEBOUNCE_MS);
+    }, entry ? 0 : fetchDelay());
     return () => {
       cancelled = true;
       clearTimeout(t);
@@ -2098,7 +2142,7 @@ export default function App({
     if (input === 'r') {
       servicesStale.current = true;
       void refresh('full');
-      sampleStats.current();
+      void sampleStats.current();
       return;
     }
     if (input === 's' && currentView.key === 'config') {
@@ -2127,6 +2171,7 @@ export default function App({
       // Arrows always move the app selection; j/k scrolls the detail pane
       // content (log scrollback, long config lists) without a mode switch.
       if (up || down) {
+        lastMoveAt.current = Date.now();
         setSelectedApp((i) => Math.min(Math.max(0, i + (down ? 1 : -1)), apps.length - 1));
         setScroll(0);
         return;
@@ -2163,7 +2208,7 @@ export default function App({
   if (loading && !data) {
     return (
       <Box flexDirection="column" height={rows}>
-        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} age={null} update={update} />
+        <Header source={source} host={hostLabel()} count={0} cert={null} disk={null} refreshing={false} fresh={null} update={update} />
         <Loading />
       </Box>
     );
@@ -2177,7 +2222,7 @@ export default function App({
         <AppSummary
           app={currentApp}
           detail={currentDetail}
-          loading={detailLoading}
+          loading={!currentDetail}
           services={services ? services.list : null}
           width={colBudget}
         />
@@ -2201,7 +2246,7 @@ export default function App({
         <ConfigView
           app={currentApp}
           config={currentApp ? configCache[currentApp.name]?.vars : {}}
-          loading={configLoading && !(currentApp && configCache[currentApp.name])}
+          loading={!(currentApp && configCache[currentApp.name])}
           reveal={reveal}
           viewport={detailViewport}
           scroll={scroll}
@@ -2273,7 +2318,7 @@ export default function App({
     currentView.key === 'services' ? (
       <ServicesTable
         services={services?.list ?? null}
-        loading={servicesLoading}
+        loading={!services}
         cursor={svcCursor}
         height={tableRows}
       />
@@ -2282,10 +2327,7 @@ export default function App({
     );
 
   const activeFilter = currentView.perApp ? appFilterLive : '';
-  // Rounded the same way the ticker above is paced, so the readout never shows
-  // a number it isn't refreshing often enough to keep true.
-  const rawAge = lastUpdated === null ? null : Math.max(0, Math.round((now - lastUpdated) / 1000));
-  const shownAge = rawAge === null || rawAge < 10 ? rawAge : rawAge < 60 ? Math.floor(rawAge / 5) * 5 : rawAge;
+  const freshLabel = lastUpdated === null ? null : fmtFreshness(Math.max(0, (now - lastUpdated) / 1000));
   return (
     <Box flexDirection="column" height={rows}>
       <Header
@@ -2295,7 +2337,7 @@ export default function App({
         cert={cert}
         disk={stats?.disk ?? null}
         refreshing={refreshing && !loading}
-        age={shownAge}
+        fresh={freshLabel}
         update={update}
         error={loadError}
       />
